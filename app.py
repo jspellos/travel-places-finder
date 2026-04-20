@@ -361,6 +361,8 @@ if mode == "📍 Near a location":
     with col2:
         radius_miles = st.slider("Within (miles)", 1, 50, 20, key="near_radius")
 
+    # When Search is pressed, do the work and stash results in session_state
+    # so they survive the reruns that Streamlit triggers on any UI interaction.
     if st.button("🔍 Search", type="primary", key="near_search"):
         if not location or not query:
             st.warning("Please fill in both location and search query.")
@@ -371,8 +373,6 @@ if mode == "📍 Near a location":
                 st.error(f"Couldn't find '{location}'. Try being more specific.")
                 st.stop()
 
-            st.success(f"📍 {geo['formatted_address']}")
-
             with st.spinner(f"Searching for '{query}' within {radius_miles} miles…"):
                 places = places_text_search(
                     query, geo["lat"], geo["lng"], radius_miles * 1609.34
@@ -380,19 +380,33 @@ if mode == "📍 Near a location":
 
             if not places:
                 st.warning("No results found. Try a wider radius or different query.")
+                st.session_state.pop("near_results", None)  # clear any stale results
             else:
                 df = places_to_dataframe(places, geo["lat"], geo["lng"])
                 df = df.sort_values("Distance (mi)").reset_index(drop=True)
+                st.session_state["near_results"] = {
+                    "geo": geo,
+                    "df": df,
+                    "query": query,
+                    "radius": radius_miles,
+                }
 
-                st.success(f"Found {len(df)} result(s) — sorted by distance")
+    # Render from session_state (survives reruns from map interactions, tab
+    # switches, etc.). Nothing renders until the first successful search.
+    if "near_results" in st.session_state:
+        res = st.session_state["near_results"]
+        st.success(f"📍 {res['geo']['formatted_address']}")
+        st.success(f"Found {len(res['df'])} result(s) for '{res['query']}' "
+                   f"within {res['radius']} miles — sorted by distance")
 
-                tab_map, tab_table = st.tabs(["🗺️ Map", "📋 Details"])
-                with tab_map:
-                    m = render_map(df, geo["lat"], geo["lng"],
-                                   center_label=geo["formatted_address"])
-                    st_folium(m, height=600, use_container_width=True)
-                with tab_table:
-                    results_table(df)
+        tab_map, tab_table = st.tabs(["🗺️ Map", "📋 Details"])
+        with tab_map:
+            m = render_map(res["df"], res["geo"]["lat"], res["geo"]["lng"],
+                           center_label=res["geo"]["formatted_address"])
+            st_folium(m, height=600, use_container_width=True,
+                      returned_objects=[], key="near_map")
+        with tab_table:
+            results_table(res["df"])
 
 
 # -------- Mode 2: Along a route --------
@@ -433,18 +447,13 @@ elif mode == "🛣️ Along a route":
                 st.error("Couldn't compute a route between those locations.")
                 st.stop()
 
-            minutes = route["duration_sec"] // 60
-            miles = route["distance_meters"] / 1609.34
-            st.success(f"🛣️ Route: {miles:.1f} miles · ~{minutes} min driving")
-
             with st.spinner(f"Searching for '{query}' along the route…"):
                 places = places_search_along_route(query, route["polyline"])
 
             if not places:
                 st.warning("No results found along this route.")
+                st.session_state.pop("route_results", None)
             else:
-                # Map center = midpoint; sort results by distance from origin
-                # (rough approximation of route order — good enough for v1)
                 mid_lat = (origin_geo["lat"] + dest_geo["lat"]) / 2
                 mid_lng = (origin_geo["lng"] + dest_geo["lng"]) / 2
 
@@ -466,31 +475,48 @@ elif mode == "🛣️ Along a route":
                 )
                 df = df.rename(columns={"Distance (mi)": "From origin (mi)"})
 
-                st.success(f"Found {len(df)} result(s) along the route")
+                st.session_state["route_results"] = {
+                    "origin_geo": origin_geo,
+                    "dest_geo": dest_geo,
+                    "route": route,
+                    "df": df,
+                    "query": query,
+                    "mid_lat": mid_lat,
+                    "mid_lng": mid_lng,
+                }
 
-                tab_map, tab_table = st.tabs(["🗺️ Map", "📋 Details"])
-                with tab_map:
-                    m = render_map(
-                        df.rename(columns={"From origin (mi)": "Distance (mi)"}),
-                        mid_lat, mid_lng,
-                        center_label=None,
-                        polyline_str=route["polyline"],
-                        endpoint_markers=[
-                            (f"Start: {origin_geo['formatted_address']}",
-                             origin_geo["lat"], origin_geo["lng"], "green"),
-                            (f"End: {dest_geo['formatted_address']}",
-                             dest_geo["lat"], dest_geo["lng"], "darkred"),
-                        ],
-                    )
-                    st_folium(m, height=600, use_container_width=True)
-                with tab_table:
-                    st.dataframe(
-                        df[["Name", "Rating", "Reviews", "Price",
-                            "From origin (mi)", "Address", "Phone", "Website", "Hours"]],
-                        use_container_width=True,
-                        hide_index=True,
-                        column_config={
-                            "Website": st.column_config.LinkColumn("Website"),
-                            "Rating":  st.column_config.NumberColumn("⭐", format="%.1f"),
-                        },
-                    )
+    # Render from session_state
+    if "route_results" in st.session_state:
+        res = st.session_state["route_results"]
+        minutes = res["route"]["duration_sec"] // 60
+        miles = res["route"]["distance_meters"] / 1609.34
+        st.success(f"🛣️ Route: {miles:.1f} miles · ~{minutes} min driving")
+        st.success(f"Found {len(res['df'])} result(s) for '{res['query']}' along the route")
+
+        tab_map, tab_table = st.tabs(["🗺️ Map", "📋 Details"])
+        with tab_map:
+            m = render_map(
+                res["df"].rename(columns={"From origin (mi)": "Distance (mi)"}),
+                res["mid_lat"], res["mid_lng"],
+                center_label=None,
+                polyline_str=res["route"]["polyline"],
+                endpoint_markers=[
+                    (f"Start: {res['origin_geo']['formatted_address']}",
+                     res["origin_geo"]["lat"], res["origin_geo"]["lng"], "green"),
+                    (f"End: {res['dest_geo']['formatted_address']}",
+                     res["dest_geo"]["lat"], res["dest_geo"]["lng"], "darkred"),
+                ],
+            )
+            st_folium(m, height=600, use_container_width=True,
+                      returned_objects=[], key="route_map")
+        with tab_table:
+            st.dataframe(
+                res["df"][["Name", "Rating", "Reviews", "Price",
+                           "From origin (mi)", "Address", "Phone", "Website", "Hours"]],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Website": st.column_config.LinkColumn("Website"),
+                    "Rating":  st.column_config.NumberColumn("⭐", format="%.1f"),
+                },
+            )
