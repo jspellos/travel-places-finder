@@ -30,24 +30,67 @@ st.set_page_config(
     layout="wide",
 )
 
-# Mobile readability: bump text sizes on narrow viewports without touching
-# the desktop layout. Uses a single @media query so desktop stays default.
+# Mobile: the hard problem isn't font-size, it's preventing the browser from
+# zooming OUT to fit overflowing content. On a 393px-wide phone, if our table
+# forces the page to 900px, the browser renders at ~44% scale and all our
+# careful font sizes become unreadable regardless of what CSS says.
+#
+# Fix has two parts: (1) contain overflow so the browser stays at 100% zoom,
+# (2) then bump font sizes. iOS Safari auto-zooms on input focus if input
+# font-size < 16px, so inputs need 16px+ to avoid trapped zoom state.
 st.markdown("""
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <style>
 @media (max-width: 768px) {
-    html, body, [class*="css"] { font-size: 16px !important; }
+    /* (1) CONTAIN OVERFLOW — the actual fix. Without this, fonts don't matter. */
+    html, body { overflow-x: hidden !important; }
+    div[data-testid="stAppViewContainer"] { overflow-x: hidden !important; }
+    .main .block-container {
+        max-width: 100% !important;
+        padding: 1rem 0.75rem !important;
+    }
+    /* Tables: horizontal scroll *inside* the table, not on the page. */
+    div[data-testid="stDataFrame"] {
+        max-width: 100% !important;
+        overflow-x: auto !important;
+    }
+
+    /* (2) FONTS — now they actually apply because we're no longer zoomed out. */
+    html { font-size: 17px !important; }
     div[data-testid="stMarkdownContainer"] p,
-    div[data-testid="stMarkdownContainer"] li { font-size: 16px !important; }
-    .stTextInput input, .stTextArea textarea,
-    .stSelectbox, .stSlider { font-size: 16px !important; }
-    .stDataFrame, .stDataFrame * { font-size: 13px !important; }
-    h1 { font-size: 1.6rem !important; }
-    h2 { font-size: 1.3rem !important; }
-    h3 { font-size: 1.15rem !important; }
-    .stAlert, .stAlert * { font-size: 15px !important; }
-    /* Folium popups render inline; inline styles below are the real fix,
-       this is the safety net. */
-    .leaflet-popup-content { font-size: 14px !important; line-height: 1.4 !important; }
+    div[data-testid="stMarkdownContainer"] li,
+    div[data-testid="stMarkdownContainer"] span { font-size: 17px !important; }
+
+    /* Inputs: 16px+ prevents iOS auto-zoom-on-focus. */
+    div[data-testid="stTextInput"] input,
+    div[data-testid="stNumberInput"] input,
+    textarea { font-size: 17px !important; }
+
+    /* Headers: scaled for mobile. */
+    h1 { font-size: 1.5rem !important; }
+    h2 { font-size: 1.25rem !important; }
+    h3 { font-size: 1.1rem !important; }
+
+    /* Captions and labels. */
+    div[data-testid="stCaptionContainer"] p { font-size: 14px !important; }
+    label { font-size: 15px !important; }
+
+    /* Status banners: readable without dominating. */
+    div[data-testid="stAlert"] { font-size: 16px !important; }
+    div[data-testid="stAlert"] p { font-size: 16px !important; }
+
+    /* Table cells: dense but legible. */
+    div[data-testid="stDataFrame"] * { font-size: 13px !important; }
+
+    /* Slider: label + numeric readout. */
+    div[data-testid="stSlider"] label { font-size: 15px !important; }
+    div[data-testid="stSlider"] [data-baseweb="slider"] { font-size: 14px !important; }
+
+    /* Radio buttons (mode selector in sidebar). */
+    div[data-testid="stRadio"] label { font-size: 16px !important; }
+
+    /* Folium popup text — inline styles in popup HTML are primary. */
+    .leaflet-popup-content { font-size: 14px !important; line-height: 1.5 !important; }
 }
 </style>
 """, unsafe_allow_html=True)
