@@ -30,6 +30,28 @@ st.set_page_config(
     layout="wide",
 )
 
+# Mobile readability: bump text sizes on narrow viewports without touching
+# the desktop layout. Uses a single @media query so desktop stays default.
+st.markdown("""
+<style>
+@media (max-width: 768px) {
+    html, body, [class*="css"] { font-size: 16px !important; }
+    div[data-testid="stMarkdownContainer"] p,
+    div[data-testid="stMarkdownContainer"] li { font-size: 16px !important; }
+    .stTextInput input, .stTextArea textarea,
+    .stSelectbox, .stSlider { font-size: 16px !important; }
+    .stDataFrame, .stDataFrame * { font-size: 13px !important; }
+    h1 { font-size: 1.6rem !important; }
+    h2 { font-size: 1.3rem !important; }
+    h3 { font-size: 1.15rem !important; }
+    .stAlert, .stAlert * { font-size: 15px !important; }
+    /* Folium popups render inline; inline styles below are the real fix,
+       this is the safety net. */
+    .leaflet-popup-content { font-size: 14px !important; line-height: 1.4 !important; }
+}
+</style>
+""", unsafe_allow_html=True)
+
 # Pull API key from Streamlit secrets. On Streamlit Cloud, set this in the
 # app's Secrets panel. Locally, put it in .streamlit/secrets.toml
 try:
@@ -208,6 +230,60 @@ def haversine_miles(lat1, lng1, lat2, lng2):
     return R * 2 * asin(sqrt(a))
 
 
+def point_to_polyline_miles(point_lat, point_lng, polyline_coords) -> Optional[float]:
+    """
+    Minimum straight-line distance in miles from a point to the nearest segment
+    of a polyline. `polyline_coords` is a list of (lat, lng) tuples.
+
+    Projects into a local flat plane using equirectangular projection with a
+    cos(latitude) correction for longitude. Accurate to well under 1% for the
+    few-miles-scale distances this app cares about. Returns None if inputs
+    are missing or the polyline is degenerate.
+
+    Caveat: this is crow-flies distance to the road, not actual driving detour.
+    A Starbucks 0.3 mi off the highway might be a 1.5 mi surface-street drive
+    to reach. For a "is this a reasonable detour" judgment, crow-flies is fine
+    and much cheaper than a second Routes API call per result.
+    """
+    if point_lat is None or point_lng is None:
+        return None
+    if not polyline_coords or len(polyline_coords) < 2:
+        return None
+
+    mi_per_deg_lat = 69.0
+    mi_per_deg_lng = 69.0 * cos(radians(point_lat))
+
+    # Translate so the query point sits at the origin of the local plane.
+    best = float("inf")
+    for i in range(len(polyline_coords) - 1):
+        lat1, lng1 = polyline_coords[i]
+        lat2, lng2 = polyline_coords[i + 1]
+        ax = (lng1 - point_lng) * mi_per_deg_lng
+        ay = (lat1 - point_lat) * mi_per_deg_lat
+        bx = (lng2 - point_lng) * mi_per_deg_lng
+        by = (lat2 - point_lat) * mi_per_deg_lat
+
+        abx, aby = bx - ax, by - ay
+        ab_sq = abx * abx + aby * aby
+        if ab_sq < 1e-12:
+            # Degenerate zero-length segment — fall back to distance from A.
+            dx, dy = -ax, -ay
+        else:
+            # Project point (at origin) onto segment AB, clamp parameter to [0,1]
+            # so the nearest point is on the segment, not its infinite extension.
+            t = (-ax * abx + -ay * aby) / ab_sq
+            t = max(0.0, min(1.0, t))
+            projx = ax + t * abx
+            projy = ay + t * aby
+            dx, dy = -projx, -projy
+
+        d = sqrt(dx * dx + dy * dy)
+        if d < best:
+            best = d
+
+    return round(best, 2)
+
+
 PRICE_LEVELS = {
     "PRICE_LEVEL_FREE":           "Free",
     "PRICE_LEVEL_INEXPENSIVE":    "$",
@@ -273,16 +349,34 @@ def render_map(df, center_lat, center_lng, center_label="Search center",
     # Result markers
     for _, row in df.iterrows():
         if pd.notna(row.get("lat")) and pd.notna(row.get("lng")):
-            popup_html = f"<b>{row['Name']}</b><br>"
+            # Inline styles here are load-bearing: Folium popups render in a
+            # Leaflet div that doesn't reliably inherit the parent page's CSS,
+            # so the @media query from main app CSS can't be trusted alone.
+            popup_html = (
+                "<div style='font-size:14px;line-height:1.5;min-width:220px;"
+                "font-family:-apple-system,BlinkMacSystemFont,sans-serif;'>"
+            )
+            popup_html += f"<b style='font-size:15px;'>{row['Name']}</b><br>"
             if pd.notna(row.get("Rating")):
                 popup_html += f"⭐ {row['Rating']} ({int(row['Reviews'])} reviews)<br>"
             if row.get("Price"):
                 popup_html += f"Price: {row['Price']}<br>"
+            # Distance: prefer "Off route" (route mode), else "Distance" (near mode).
+            off_route = row.get("Off route (mi)")
+            distance = row.get("Distance (mi)")
+            if pd.notna(off_route):
+                popup_html += f"🛣️ <b>{off_route} mi</b> off route<br>"
+            elif pd.notna(distance):
+                popup_html += f"📍 {distance} mi away<br>"
             popup_html += f"{row['Address']}<br>"
             if row.get("Phone"):
                 popup_html += f"📞 {row['Phone']}<br>"
             if row.get("Website"):
-                popup_html += f"<a href='{row['Website']}' target='_blank'>Website</a>"
+                popup_html += (
+                    f"<a href='{row['Website']}' target='_blank' "
+                    f"style='font-size:14px;'>Website</a>"
+                )
+            popup_html += "</div>"
             folium.Marker(
                 [row["lat"], row["lng"]],
                 popup=folium.Popup(popup_html, max_width=320),
@@ -458,22 +552,38 @@ elif mode == "🛣️ Along a route":
                 mid_lng = (origin_geo["lng"] + dest_geo["lng"]) / 2
 
                 df = places_to_dataframe(places, mid_lat, mid_lng)
-                df["_from_origin"] = df.apply(
-                    lambda r: haversine_miles(
-                        origin_geo["lat"], origin_geo["lng"], r["lat"], r["lng"]
-                    ) if pd.notna(r["lat"]) else 999,
+
+                # Decode the route polyline once and compute each result's
+                # perpendicular distance to the nearest segment. This answers
+                # "how far off the highway is this?" — the actual question
+                # a driver has when considering a detour.
+                route_coords = polyline_lib.decode(route["polyline"])
+                df["Off route (mi)"] = df.apply(
+                    lambda r: point_to_polyline_miles(
+                        r["lat"], r["lng"], route_coords
+                    ) if pd.notna(r["lat"]) else None,
                     axis=1,
                 )
-                df = (df.sort_values("_from_origin")
-                        .drop(columns=["_from_origin"])
-                        .reset_index(drop=True))
-                df["Distance (mi)"] = df.apply(
+
+                # Also track distance from origin as a rough "where along the
+                # trip is this" indicator. Not a sort key anymore, just context.
+                df["From origin (mi)"] = df.apply(
                     lambda r: round(haversine_miles(
-                        origin_geo["lat"], origin_geo["lng"], r["lat"], r["lng"]
+                        origin_geo["lat"], origin_geo["lng"],
+                        r["lat"], r["lng"],
                     ), 2) if pd.notna(r["lat"]) else None,
                     axis=1,
                 )
-                df = df.rename(columns={"Distance (mi)": "From origin (mi)"})
+
+                # The haversine-from-midpoint "Distance (mi)" that
+                # places_to_dataframe computed is meaningless here.
+                df = df.drop(columns=["Distance (mi)"])
+
+                # Primary sort: minimize detour. Near-zero-off-route results
+                # bubble to the top — exactly what a driver on the highway wants.
+                df = df.sort_values(
+                    "Off route (mi)", na_position="last"
+                ).reset_index(drop=True)
 
                 st.session_state["route_results"] = {
                     "origin_geo": origin_geo,
@@ -491,12 +601,39 @@ elif mode == "🛣️ Along a route":
         minutes = res["route"]["duration_sec"] // 60
         miles = res["route"]["distance_meters"] / 1609.34
         st.success(f"🛣️ Route: {miles:.1f} miles · ~{minutes} min driving")
-        st.success(f"Found {len(res['df'])} result(s) for '{res['query']}' along the route")
+
+        df_all = res["df"]
+
+        # Live detour filter — changes re-run the script but stored results
+        # stay in session_state, so no API call is triggered.
+        max_off = df_all["Off route (mi)"].dropna().max()
+        if pd.notna(max_off) and max_off > 0.5:
+            slider_max = float(round(max_off + 0.5, 1))
+            default_val = float(min(max_off, 5.0))
+            detour_limit = st.slider(
+                "Max detour off route (miles)",
+                min_value=0.1,
+                max_value=slider_max,
+                value=default_val,
+                step=0.1,
+                key="route_detour_limit",
+                help=("Filter out results that would require driving further off "
+                      "the route. Straight-line distance to the road, not actual "
+                      "driving detour."),
+            )
+            df_view = df_all[df_all["Off route (mi)"] <= detour_limit].reset_index(drop=True)
+        else:
+            df_view = df_all
+
+        st.success(
+            f"Showing {len(df_view)} of {len(df_all)} result(s) for "
+            f"'{res['query']}' — sorted by detour distance"
+        )
 
         tab_map, tab_table = st.tabs(["🗺️ Map", "📋 Details"])
         with tab_map:
             m = render_map(
-                res["df"].rename(columns={"From origin (mi)": "Distance (mi)"}),
+                df_view,
                 res["mid_lat"], res["mid_lng"],
                 center_label=None,
                 polyline_str=res["route"]["polyline"],
@@ -511,12 +648,19 @@ elif mode == "🛣️ Along a route":
                       returned_objects=[], key="route_map")
         with tab_table:
             st.dataframe(
-                res["df"][["Name", "Rating", "Reviews", "Price",
-                           "From origin (mi)", "Address", "Phone", "Website", "Hours"]],
+                df_view[["Name", "Rating", "Reviews", "Price",
+                         "Off route (mi)", "From origin (mi)",
+                         "Address", "Phone", "Website", "Hours"]],
                 use_container_width=True,
                 hide_index=True,
                 column_config={
                     "Website": st.column_config.LinkColumn("Website"),
                     "Rating":  st.column_config.NumberColumn("⭐", format="%.1f"),
+                    "Off route (mi)":   st.column_config.NumberColumn(
+                        "Off route (mi)", format="%.2f"
+                    ),
+                    "From origin (mi)": st.column_config.NumberColumn(
+                        "From origin (mi)", format="%.2f"
+                    ),
                 },
             )
