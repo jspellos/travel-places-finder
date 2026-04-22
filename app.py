@@ -340,6 +340,42 @@ def chunk_polyline(coords, n_chunks: int, overlap_fraction: float = 0.05) -> lis
     return chunks if chunks else [coords]
 
 
+def trim_polyline_start(coords, skip_miles: float):
+    """
+    Return (trimmed_coords, skipped_miles) — the portion of the polyline
+    starting at approximately `skip_miles` of arc length from the origin.
+
+    Why: along-route search is for discovery mid-trip and toward the
+    destination. Results clustered near the origin are better served by the
+    "Near a location" mode. Skipping the first N miles lets the route mode
+    escape the dense origin area and focus on what's actually ahead.
+
+    If the route is too short to trim meaningfully (< skip + 5 mi), returns
+    (coords, 0.0) so the caller falls back to the full route.
+    """
+    if skip_miles <= 0 or len(coords) < 2:
+        return coords, 0.0
+
+    cum = [0.0]
+    for i in range(1, len(coords)):
+        cum.append(cum[-1] + haversine_miles(
+            coords[i - 1][0], coords[i - 1][1],
+            coords[i][0],     coords[i][1],
+        ))
+    total = cum[-1]
+    if total < skip_miles + 5:
+        return coords, 0.0  # trip too short to skip meaningfully
+
+    # First vertex at or past the skip threshold.
+    start_idx = 0
+    while start_idx < len(cum) and cum[start_idx] < skip_miles:
+        start_idx += 1
+    if start_idx >= len(coords):
+        return coords, 0.0  # safety fallback
+
+    return coords[start_idx:], cum[start_idx]
+
+
 PRICE_LEVELS = {
     "PRICE_LEVEL_FREE":           "Free",
     "PRICE_LEVEL_INEXPENSIVE":    "$",
@@ -458,11 +494,17 @@ def render_map(df, center_lat, center_lng, center_label="Search center",
 
 def results_table(df):
     """Render the details table with consistent formatting."""
+    # Show up to ~18 rows before scrolling. Streamlit rows are roughly 35px
+    # plus a 38px header; cap at 18 so the table doesn't dominate the page
+    # on short result sets and doesn't sprawl endlessly on long ones.
+    visible_rows = min(len(df), 18)
+    table_height = visible_rows * 35 + 38
     st.dataframe(
         df[["Name", "Rating", "Reviews", "Price", "Distance (mi)",
             "Address", "Phone", "Website", "Hours"]],
         use_container_width=True,
         hide_index=True,
+        height=table_height,
         column_config={
             "Website": st.column_config.LinkColumn("Website"),
             "Rating":  st.column_config.NumberColumn("⭐", format="%.1f"),
@@ -575,6 +617,18 @@ elif mode == "🛣️ Along a route":
         key="route_query",
     )
 
+    # Route mode is for discovery mid-trip and toward the destination. The
+    # "Near a location" mode covers the origin area. Default 25 mi — tunable
+    # because "25 mi out of Manhattan" ≠ "25 mi out of Poughkeepsie."
+    skip_miles = st.slider(
+        "Skip first N miles",
+        min_value=0, max_value=50, value=25, step=5,
+        key="route_skip",
+        help=("Exclude results clustered near your origin — use "
+              "'Near a location' mode for those. This mode is for what's "
+              "ahead on your trip."),
+    )
+
     if st.button("🔍 Search", type="primary", key="route_search"):
         if not origin or not destination or not query:
             st.warning("Please fill in all three fields.")
@@ -597,22 +651,32 @@ elif mode == "🛣️ Along a route":
                 st.error("Couldn't compute a route between those locations.")
                 st.stop()
 
-            # Decide how many chunks to split the route into. One query per
-            # ~40 miles, capped at 5. Each chunk gets Google's full 20-result
-            # budget, so the destination end is guaranteed its own fair shot.
+            # Decode the full route and optionally trim the start. The full
+            # polyline is used for off-route distance (so "0.3 mi off route"
+            # means off the actual highway) and for drawing the map. The
+            # trimmed polyline is what we send to the Places API.
             route_miles = route["distance_meters"] / 1609.34
-            n_chunks = max(1, min(5, 1 + int(route_miles // 40)))
             route_coords = polyline_lib.decode(route["polyline"])
+            search_coords, skipped = trim_polyline_start(route_coords, skip_miles)
+            effective_miles = route_miles - skipped
+
+            # Chunking decisions based on the *effective* length we're actually
+            # searching. One chunk per ~40 mi, capped at 5.
+            n_chunks = max(1, min(5, 1 + int(effective_miles // 40)))
+
+            skip_note = f" · skipping first {skipped:.0f} mi" if skipped > 0 else ""
 
             if n_chunks == 1:
-                with st.spinner(f"Searching for '{query}' along the route…"):
-                    places = places_search_along_route(query, route["polyline"])
+                with st.spinner(f"Searching for '{query}' along route{skip_note}…"):
+                    encoded = (route["polyline"] if search_coords is route_coords
+                               else polyline_lib.encode(search_coords))
+                    places = places_search_along_route(query, encoded)
             else:
                 with st.spinner(
-                    f"Searching for '{query}' along route "
-                    f"({n_chunks} segments of ~{route_miles / n_chunks:.0f} mi each)…"
+                    f"Searching for '{query}' along route{skip_note} · "
+                    f"{n_chunks} segments of ~{effective_miles / n_chunks:.0f} mi each…"
                 ):
-                    chunks = chunk_polyline(route_coords, n_chunks)
+                    chunks = chunk_polyline(search_coords, n_chunks)
                     places = []
                     seen_ids = set()
                     for sub_coords in chunks:
@@ -675,6 +739,8 @@ elif mode == "🛣️ Along a route":
                     "query": query,
                     "mid_lat": mid_lat,
                     "mid_lng": mid_lng,
+                    "skipped_miles": skipped,
+                    "skip_requested": skip_miles,
                 }
 
     # Render from session_state
@@ -682,7 +748,22 @@ elif mode == "🛣️ Along a route":
         res = st.session_state["route_results"]
         minutes = res["route"]["duration_sec"] // 60
         miles = res["route"]["distance_meters"] / 1609.34
-        st.success(f"🛣️ Route: {miles:.1f} miles · ~{minutes} min driving")
+        skipped = res.get("skipped_miles", 0)
+        skip_requested = res.get("skip_requested", 0)
+
+        if skipped > 0:
+            st.success(
+                f"🛣️ Route: {miles:.1f} mi · ~{minutes} min driving · "
+                f"searched last {miles - skipped:.0f} mi "
+                f"(skipped first {skipped:.0f})"
+            )
+        elif skip_requested > 0:
+            st.info(
+                f"🛣️ Route: {miles:.1f} mi · ~{minutes} min driving · "
+                f"too short to skip {skip_requested} mi — searched entire route"
+            )
+        else:
+            st.success(f"🛣️ Route: {miles:.1f} mi · ~{minutes} min driving")
 
         df_all = res["df"]
 
@@ -729,12 +810,15 @@ elif mode == "🛣️ Along a route":
             st_folium(m, height=600, use_container_width=True,
                       returned_objects=[], key="route_map")
         with tab_table:
+            visible_rows = min(len(df_view), 18)
+            table_height = visible_rows * 35 + 38
             st.dataframe(
                 df_view[["Name", "Rating", "Reviews", "Price",
                          "Off route (mi)", "From origin (mi)",
                          "Address", "Phone", "Website", "Hours"]],
                 use_container_width=True,
                 hide_index=True,
+                height=table_height,
                 column_config={
                     "Website": st.column_config.LinkColumn("Website"),
                     "Rating":  st.column_config.NumberColumn("⭐", format="%.1f"),
