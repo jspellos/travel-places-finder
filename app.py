@@ -74,14 +74,30 @@ st.html("""
     div[data-testid="stNumberInput"] input,
     textarea { font-size: 17px !important; }
 
-    /* Headings: real hierarchy, not three sizes pretending to be one. */
-    h1 { font-size: 1.75rem !important; line-height: 1.2 !important;
-         margin-top: 0.25rem !important; margin-bottom: 0.5rem !important;
-         font-weight: 700 !important; }
-    h2 { font-size: 1.3rem !important;  line-height: 1.25 !important;
-         margin-top: 1rem !important;   margin-bottom: 0.5rem !important; }
-    h3 { font-size: 1.05rem !important; line-height: 1.3 !important;
-         color: #555 !important; font-weight: 600 !important; }
+    /* Headings: Streamlit's JS injects stylesheets AFTER our CSS loads, and
+       those rules use data-testid selectors. To win the specificity race,
+       we have to match their exact selector chain — a bare h1 rule loses.
+       Confirmed by observing "flash of correct size, then shrink back" on
+       Android Chrome — classic late-stylesheet symptom. */
+    [data-testid="stMarkdownContainer"] h1,
+    [data-testid="stHeading"] h1,
+    h1[data-testid="stHeading"] {
+        font-size: 1.75rem !important; line-height: 1.2 !important;
+        margin-top: 0.25rem !important; margin-bottom: 0.5rem !important;
+        font-weight: 700 !important;
+    }
+    [data-testid="stMarkdownContainer"] h2,
+    [data-testid="stHeading"] h2,
+    h2[data-testid="stHeading"] {
+        font-size: 1.3rem !important; line-height: 1.25 !important;
+        margin-top: 1rem !important; margin-bottom: 0.5rem !important;
+    }
+    [data-testid="stMarkdownContainer"] h3,
+    [data-testid="stHeading"] h3,
+    h3[data-testid="stHeading"] {
+        font-size: 1.05rem !important; line-height: 1.3 !important;
+        color: #555 !important; font-weight: 600 !important;
+    }
 
     div[data-testid="stCaptionContainer"] p { font-size: 14px !important; }
     label { font-size: 15px !important; }
