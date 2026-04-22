@@ -30,70 +30,71 @@ st.set_page_config(
     layout="wide",
 )
 
-# Mobile: the hard problem isn't font-size, it's preventing the browser from
-# zooming OUT to fit overflowing content. On a 393px-wide phone, if our table
-# forces the page to 900px, the browser renders at ~44% scale and all our
-# careful font sizes become unreadable regardless of what CSS says.
+# Mobile CSS. Two things worth knowing:
+#   (1) st.html() bypasses Streamlit's markdown pipeline, which sometimes
+#       mangles CSS blocks (and was rendering a stray "}" at the top of the
+#       page when we used st.markdown).
+#   (2) <meta name="viewport"> doesn't work via Python injection — it has to
+#       be in <head>, not <body>. Streamlit Cloud already sets a correct
+#       viewport by default, so we don't need to re-add it.
 #
-# Fix has two parts: (1) contain overflow so the browser stays at 100% zoom,
-# (2) then bump font sizes. iOS Safari auto-zooms on input focus if input
-# font-size < 16px, so inputs need 16px+ to avoid trapped zoom state.
-st.markdown("""
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+# The real fix for mobile readability is containing horizontal overflow
+# (so the browser doesn't zoom out to fit) and then scaling fonts. Also
+# kills the huge top padding Streamlit applies on mobile by default.
+st.html("""
 <style>
 @media (max-width: 768px) {
-    /* (1) CONTAIN OVERFLOW — the actual fix. Without this, fonts don't matter. */
+    /* Contain overflow — without this, font sizes don't matter because
+       the browser zooms out to fit any over-wide element. */
     html, body { overflow-x: hidden !important; }
     div[data-testid="stAppViewContainer"] { overflow-x: hidden !important; }
     .main .block-container {
         max-width: 100% !important;
-        padding: 1rem 0.75rem !important;
+        padding: 0.5rem 0.75rem 1rem 0.75rem !important;
     }
-    /* Tables: horizontal scroll *inside* the table, not on the page. */
+    /* Kill the ~6rem header spacer Streamlit inserts above content. */
+    header[data-testid="stHeader"] { height: 2.5rem !important; }
+    div[data-testid="stToolbar"] { top: 0.25rem !important; }
+
+    /* Horizontal scroll stays inside the table, not the page. */
     div[data-testid="stDataFrame"] {
         max-width: 100% !important;
         overflow-x: auto !important;
     }
 
-    /* (2) FONTS — now they actually apply because we're no longer zoomed out. */
+    /* Base font. */
     html { font-size: 17px !important; }
     div[data-testid="stMarkdownContainer"] p,
     div[data-testid="stMarkdownContainer"] li,
     div[data-testid="stMarkdownContainer"] span { font-size: 17px !important; }
 
-    /* Inputs: 16px+ prevents iOS auto-zoom-on-focus. */
+    /* Inputs need 16px+ on iOS to prevent auto-zoom-on-focus.
+       No-op on Android but doesn't hurt. */
     div[data-testid="stTextInput"] input,
     div[data-testid="stNumberInput"] input,
     textarea { font-size: 17px !important; }
 
-    /* Headers: scaled for mobile. */
-    h1 { font-size: 1.5rem !important; }
-    h2 { font-size: 1.25rem !important; }
-    h3 { font-size: 1.1rem !important; }
+    /* Headings: real hierarchy, not three sizes pretending to be one. */
+    h1 { font-size: 1.75rem !important; line-height: 1.2 !important;
+         margin-top: 0.25rem !important; margin-bottom: 0.5rem !important;
+         font-weight: 700 !important; }
+    h2 { font-size: 1.3rem !important;  line-height: 1.25 !important;
+         margin-top: 1rem !important;   margin-bottom: 0.5rem !important; }
+    h3 { font-size: 1.05rem !important; line-height: 1.3 !important;
+         color: #555 !important; font-weight: 600 !important; }
 
-    /* Captions and labels. */
     div[data-testid="stCaptionContainer"] p { font-size: 14px !important; }
     label { font-size: 15px !important; }
-
-    /* Status banners: readable without dominating. */
-    div[data-testid="stAlert"] { font-size: 16px !important; }
     div[data-testid="stAlert"] p { font-size: 16px !important; }
-
-    /* Table cells: dense but legible. */
     div[data-testid="stDataFrame"] * { font-size: 13px !important; }
-
-    /* Slider: label + numeric readout. */
     div[data-testid="stSlider"] label { font-size: 15px !important; }
-    div[data-testid="stSlider"] [data-baseweb="slider"] { font-size: 14px !important; }
-
-    /* Radio buttons (mode selector in sidebar). */
     div[data-testid="stRadio"] label { font-size: 16px !important; }
 
-    /* Folium popup text — inline styles in popup HTML are primary. */
+    /* Folium popups — inline styles in popup HTML are primary. */
     .leaflet-popup-content { font-size: 14px !important; line-height: 1.5 !important; }
 }
 </style>
-""", unsafe_allow_html=True)
+""")
 
 # Pull API key from Streamlit secrets. On Streamlit Cloud, set this in the
 # app's Secrets panel. Locally, put it in .streamlit/secrets.toml
