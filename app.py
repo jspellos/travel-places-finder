@@ -284,6 +284,62 @@ def point_to_polyline_miles(point_lat, point_lng, polyline_coords) -> Optional[f
     return round(best, 2)
 
 
+def chunk_polyline(coords, n_chunks: int, overlap_fraction: float = 0.05) -> list:
+    """
+    Split a polyline into n_chunks sub-polylines of roughly equal arc length,
+    with a small overlap between adjacent chunks.
+
+    Why: Google's searchAlongRoute returns up to 20 results ranked by their own
+    relevance. On long routes through dense areas, those 20 slots get consumed
+    near the origin before the algorithm reaches the destination end. Splitting
+    the polyline into chunks and querying each independently gives every
+    segment of the trip its own result budget.
+
+    Overlap prevents a result sitting exactly on a chunk boundary from falling
+    through the cracks of how Google treats segment endpoints.
+
+    Returns a list of (lat, lng) sublists, each suitable for re-encoding.
+    If the polyline is too short or n_chunks <= 1, returns [coords] unchanged.
+    """
+    if n_chunks <= 1 or len(coords) < 4:
+        return [coords]
+
+    # Cumulative arc length at each vertex, in miles.
+    cum = [0.0]
+    for i in range(1, len(coords)):
+        cum.append(cum[-1] + haversine_miles(
+            coords[i - 1][0], coords[i - 1][1],
+            coords[i][0],     coords[i][1],
+        ))
+    total = cum[-1]
+    if total < 1.0:  # sub-mile route — chunking is meaningless
+        return [coords]
+
+    chunk_len = total / n_chunks
+    overlap = chunk_len * overlap_fraction
+
+    chunks = []
+    for k in range(n_chunks):
+        start = max(0.0, k * chunk_len - overlap)
+        end   = min(total, (k + 1) * chunk_len + overlap)
+
+        # Find the vertex range that covers [start, end]. We want to include
+        # the last vertex at-or-before start and the first vertex at-or-after
+        # end, so the resulting sub-polyline fully spans the window.
+        start_idx = 0
+        while start_idx < len(cum) - 1 and cum[start_idx + 1] < start:
+            start_idx += 1
+        end_idx = len(coords) - 1
+        while end_idx > 0 and cum[end_idx - 1] > end:
+            end_idx -= 1
+
+        chunk = coords[start_idx:end_idx + 1]
+        if len(chunk) >= 2:
+            chunks.append(chunk)
+
+    return chunks if chunks else [coords]
+
+
 PRICE_LEVELS = {
     "PRICE_LEVEL_FREE":           "Free",
     "PRICE_LEVEL_INEXPENSIVE":    "$",
@@ -541,8 +597,34 @@ elif mode == "🛣️ Along a route":
                 st.error("Couldn't compute a route between those locations.")
                 st.stop()
 
-            with st.spinner(f"Searching for '{query}' along the route…"):
-                places = places_search_along_route(query, route["polyline"])
+            # Decide how many chunks to split the route into. One query per
+            # ~40 miles, capped at 5. Each chunk gets Google's full 20-result
+            # budget, so the destination end is guaranteed its own fair shot.
+            route_miles = route["distance_meters"] / 1609.34
+            n_chunks = max(1, min(5, 1 + int(route_miles // 40)))
+            route_coords = polyline_lib.decode(route["polyline"])
+
+            if n_chunks == 1:
+                with st.spinner(f"Searching for '{query}' along the route…"):
+                    places = places_search_along_route(query, route["polyline"])
+            else:
+                with st.spinner(
+                    f"Searching for '{query}' along route "
+                    f"({n_chunks} segments of ~{route_miles / n_chunks:.0f} mi each)…"
+                ):
+                    chunks = chunk_polyline(route_coords, n_chunks)
+                    places = []
+                    seen_ids = set()
+                    for sub_coords in chunks:
+                        encoded = polyline_lib.encode(sub_coords)
+                        sub_places = places_search_along_route(query, encoded)
+                        for p in sub_places:
+                            pid = p.get("id")
+                            # Dedupe by place_id; a Starbucks near a chunk
+                            # boundary will appear in both adjacent chunks.
+                            if pid and pid not in seen_ids:
+                                seen_ids.add(pid)
+                                places.append(p)
 
             if not places:
                 st.warning("No results found along this route.")
