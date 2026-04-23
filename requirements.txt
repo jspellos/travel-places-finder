@@ -4,3 +4,4 @@ folium>=0.15.0
 streamlit-folium>=0.15.0
 pandas>=2.0.0
 polyline>=2.0.0
+anthropic
