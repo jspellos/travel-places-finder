@@ -23,6 +23,15 @@ import polyline as polyline_lib
 from math import radians, cos, sin, asin, sqrt
 from typing import Optional
 
+# Anthropic is optional — the app runs fine without it, the natural-language
+# shortcut just hides itself. Keeps the app working for anyone cloning the
+# repo who doesn't have a Claude API key yet.
+try:
+    from anthropic import Anthropic
+    _ANTHROPIC_AVAILABLE = True
+except ImportError:
+    _ANTHROPIC_AVAILABLE = False
+
 # -------------------- Config --------------------
 st.set_page_config(
     page_title="Travel Places Finder",
@@ -118,6 +127,15 @@ try:
     API_KEY = st.secrets.get("GOOGLE_MAPS_API_KEY", "")
 except Exception:
     API_KEY = ""
+
+# Anthropic key is optional — enables the natural-language shortcut.
+# Absence doesn't break the app, it just hides that feature.
+try:
+    ANTHROPIC_KEY = st.secrets.get("ANTHROPIC_API_KEY", "")
+except Exception:
+    ANTHROPIC_KEY = ""
+
+SHORTCUT_ENABLED = bool(ANTHROPIC_KEY) and _ANTHROPIC_AVAILABLE
 
 if not API_KEY:
     st.error("⚠️ Google Maps API key not found.")
@@ -572,14 +590,194 @@ def results_table(df):
     )
 
 
+# -------------------- Natural-language parser --------------------
+
+# Tool schema: Claude must return exactly these fields via tool_use. Using
+# a tool call (rather than "please respond in JSON") is the hard contract —
+# the API won't return malformed JSON, saving us from defensive parsing.
+PARSE_TOOL = {
+    "name": "parse_travel_request",
+    "description": (
+        "Parse a user's natural-language travel/search request into "
+        "structured search parameters."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "mode": {
+                "type": "string",
+                "enum": ["near_location", "along_route"],
+                "description": (
+                    "near_location: user wants places within a radius of a "
+                    "single point (hotel, city, landmark). "
+                    "along_route: user wants places along a drive between "
+                    "two explicit points (A to B)."
+                ),
+            },
+            "query": {
+                "type": "string",
+                "description": (
+                    "What the user is looking for, normalized to a clean "
+                    "search term. e.g. 'vegan dinner' -> 'vegan restaurant', "
+                    "'charging' -> 'EV charging station'."
+                ),
+            },
+            "location": {
+                "type": "string",
+                "description": (
+                    "For near_location mode only. The anchor point: city, "
+                    "address, hotel, landmark. Use the most specific form "
+                    "the user gave."
+                ),
+            },
+            "radius_miles": {
+                "type": "integer",
+                "description": (
+                    "For near_location mode. Default 10 if unspecified. "
+                    "Infer from words like 'nearby' (5), 'around' (10), "
+                    "'within an hour' (50)."
+                ),
+            },
+            "origin": {
+                "type": "string",
+                "description": "For along_route mode. The starting point.",
+            },
+            "destination": {
+                "type": "string",
+                "description": "For along_route mode. The ending point.",
+            },
+            "skip_first_miles": {
+                "type": "integer",
+                "description": (
+                    "For along_route mode. How many miles of the start of "
+                    "the route to skip. Default 25. Infer from phrases like "
+                    "'once I'm out of the city' (25-40) or "
+                    "'the whole way' (0)."
+                ),
+            },
+        },
+        "required": ["mode", "query"],
+    },
+}
+
+PARSE_SYSTEM_PROMPT = (
+    "You are a parser for a travel places finder. The user describes what "
+    "they want in natural language; you translate it to structured search "
+    "parameters by calling the parse_travel_request tool. Always call the "
+    "tool — never respond with plain text. If the request is ambiguous, "
+    "make a reasonable best guess rather than asking for clarification; "
+    "the user will see your interpretation and can adjust before searching."
+)
+
+
+def parse_with_claude(user_text: str) -> Optional[dict]:
+    """
+    Ask Claude to parse a natural-language request into search parameters.
+    Returns the tool input dict, or None on any failure (network, parse, etc.).
+
+    Uses Claude Haiku — this is a small, structured parsing task that doesn't
+    need Sonnet/Opus. Costs a fraction of a cent per call.
+    """
+    if not SHORTCUT_ENABLED or not user_text.strip():
+        return None
+    try:
+        client = Anthropic(api_key=ANTHROPIC_KEY)
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=512,
+            system=PARSE_SYSTEM_PROMPT,
+            tools=[PARSE_TOOL],
+            tool_choice={"type": "tool", "name": "parse_travel_request"},
+            messages=[{"role": "user", "content": user_text}],
+        )
+    except Exception as e:
+        st.error(f"Parse error: {e}")
+        return None
+
+    # Find the tool_use block in the response — with tool_choice forcing a
+    # specific tool, there should be exactly one.
+    for block in response.content:
+        if getattr(block, "type", None) == "tool_use":
+            return dict(block.input)
+    return None
+
+
 # -------------------- UI --------------------
 
 st.title("🗺️ Travel Places Finder")
 st.caption("Find places at destinations you're planning to visit — not just where you are now.")
 
+# Natural-language shortcut: one box that fills in the form below via
+# Claude. Populates session_state so existing widgets pick up the values
+# on the next rerun. User can tweak anything before hitting Search.
+if SHORTCUT_ENABLED:
+    shortcut_text = st.text_input(
+        "💬 Or describe what you want in plain English",
+        placeholder=(
+            "e.g. 'vegan dinner near Hilton Garden Inn Tarrytown' — or — "
+            "'Starbucks from Bayside NY to Philadelphia, skip the first 30 miles'"
+        ),
+        key="shortcut_text",
+    )
+
+    # Trigger parsing when the text changes (Streamlit reruns on Enter).
+    # Guard with a session_state flag so we don't re-parse identical text
+    # on unrelated reruns (e.g. slider changes elsewhere on the page).
+    last_parsed = st.session_state.get("shortcut_last_parsed", "")
+    if shortcut_text and shortcut_text != last_parsed:
+        with st.spinner("Interpreting…"):
+            parsed = parse_with_claude(shortcut_text)
+        st.session_state["shortcut_last_parsed"] = shortcut_text
+
+        if parsed:
+            st.session_state["shortcut_parsed"] = parsed
+            # Populate the appropriate mode's form fields. Widgets below
+            # read from these session_state keys on render.
+            if parsed.get("mode") == "near_location":
+                st.session_state["search_mode_radio"] = "📍 Near a location"
+                if parsed.get("location"):
+                    st.session_state["near_location"] = parsed["location"]
+                if parsed.get("query"):
+                    st.session_state["near_query"] = parsed["query"]
+                if parsed.get("radius_miles"):
+                    st.session_state["near_radius"] = int(parsed["radius_miles"])
+            elif parsed.get("mode") == "along_route":
+                st.session_state["search_mode_radio"] = "🛣️ Along a route"
+                if parsed.get("origin"):
+                    st.session_state["route_origin"] = parsed["origin"]
+                if parsed.get("destination"):
+                    st.session_state["route_dest"] = parsed["destination"]
+                if parsed.get("query"):
+                    st.session_state["route_query"] = parsed["query"]
+                if parsed.get("skip_first_miles") is not None:
+                    st.session_state["route_skip"] = int(parsed["skip_first_miles"])
+            # Rerun so the mode radio and widgets below pick up the new state.
+            st.rerun()
+
+    # Soft-mode confirmation: show what Claude interpreted, so the user can
+    # spot mistakes before the Google API call. Persists across reruns.
+    if "shortcut_parsed" in st.session_state:
+        p = st.session_state["shortcut_parsed"]
+        if p.get("mode") == "near_location":
+            summary = (
+                f"📍 **Near a location** · *{p.get('query', '')}* "
+                f"near **{p.get('location', '?')}** "
+                f"within {p.get('radius_miles', 10)} miles"
+            )
+        else:
+            skip = p.get("skip_first_miles", 25)
+            skip_note = f" · skip first {skip} mi" if skip else ""
+            summary = (
+                f"🛣️ **Along a route** · *{p.get('query', '')}* "
+                f"from **{p.get('origin', '?')}** "
+                f"to **{p.get('destination', '?')}**{skip_note}"
+            )
+        st.info(f"Interpreted as — {summary}  \n*Adjust the fields below if needed, then Search.*")
+
 mode = st.sidebar.radio(
     "Search mode",
     ["📍 Near a location", "🛣️ Along a route"],
+    key="search_mode_radio",
     help=(
         "Near a location: find places within X miles of a destination, hotel, "
         "or landmark. Along a route: find places on the drive between two points."
