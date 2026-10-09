@@ -194,20 +194,28 @@ def require_password():
         return
 
     token = _auth_token(APP_PASSWORD)
-    if hmac.compare_digest(st.context.cookies.get(AUTH_KEY, ""), token):
+    cookie = st.context.cookies.get(AUTH_KEY)
+    if isinstance(cookie, str) and hmac.compare_digest(cookie, token):
         st.session_state["authed"] = True
         return
 
     st.title("🗺️ Travel Places Finder")
 
     # The localStorage answer arrives a moment after the page loads (the
-    # component reruns the script when it replies), so the form renders in
-    # the meantime — if the component never answers, the password still works.
-    if _JS_EVAL_AVAILABLE:
+    # component reruns the script when it replies: "" if nothing is saved).
+    # Until then show "Opening…" rather than flashing the lock screen at
+    # people who are already logged in. The button is the escape hatch in
+    # case the component never answers (e.g. scripts blocked).
+    if _JS_EVAL_AVAILABLE and not st.session_state.get("show_login"):
         saved = streamlit_js_eval(
             js_expressions=f"localStorage.getItem('{AUTH_KEY}') || ''",
             key="auth_read",
         )
+        if saved is None:
+            st.caption("⏳ Opening…")
+            st.button("Enter password instead", type="tertiary",
+                      on_click=lambda: st.session_state.update(show_login=True))
+            st.stop()
         if isinstance(saved, str) and saved and hmac.compare_digest(saved, token):
             st.session_state["authed"] = True
             st.rerun()
