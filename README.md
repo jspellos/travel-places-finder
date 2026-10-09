@@ -6,10 +6,14 @@ A Streamlit app for finding places (restaurants, shops, hotels, etc.) at destina
 
 Two search modes:
 
-1. **Near a location** — Radius search around any address, hotel name, or landmark. Example: "vegan restaurants within 20 miles of Ossining, NY."
-2. **Along a route** — Finds places along the actual driving path between two points, using Google's `searchAlongRouteParameters`. Example: "Starbucks on the drive from Queens to Croton-on-Hudson."
+1. **Near a place** — Radius search around any address, hotel name, or landmark. Example: "vegan restaurants within 20 miles of Ossining, NY." A **Use my location** button fills in where you are now.
+2. **Along a drive** — Finds places along the actual driving path between two points, using Google's `searchAlongRouteParameters`. Example: "Starbucks on the drive from Queens to Croton-on-Hudson." Each result shows how far off the road it is and roughly which mile of the trip it's at.
 
-Results render as an interactive Folium map (with clickable pins) and a sortable details table.
+Results show as phone-friendly cards — rating, price, distance, open/closed now, and today's hours — with **Directions**, **Call**, and **Website** buttons that hand off to the phone's Maps and dialer apps. Switch to **Map** for numbered pins that match the cards. Filter by *open now* or minimum rating and change the sort without another search.
+
+With an Anthropic key set, an **Ask in plain English** box (e.g. "vegan dinner near Hilton Garden Inn Tarrytown") fills in the form and runs the search for you.
+
+An optional **password screen** keeps the deployed app private; each browser remembers the password for a year.
 
 ## Prerequisites
 
@@ -53,6 +57,7 @@ copy .streamlit\secrets.toml.example .streamlit\secrets.toml
 cp .streamlit/secrets.toml.example .streamlit/secrets.toml
 
 # Edit .streamlit/secrets.toml and paste in your API key
+# (plus the optional Anthropic key and app password — see the comments)
 ```
 
 ### 3. Run it
@@ -70,18 +75,23 @@ The app opens at `http://localhost:8501`.
 3. In the deployed app's **Settings → Secrets**, paste:
    ```toml
    GOOGLE_MAPS_API_KEY = "your-key-here"
+   ANTHROPIC_API_KEY = "your-key-here"   # optional
+   APP_PASSWORD = "pick-a-password"      # strongly recommended once deployed
    ```
+   Without `APP_PASSWORD`, anyone with the link can run searches on your API keys.
 4. Done. The app is now live at `https://your-app-name.streamlit.app`.
 
 ## File structure
 
 ```
 travel-places-finder/
-├── app.py                              # Main Streamlit app
+├── app.py                              # Main Streamlit app (UI + API calls)
+├── geo.py                              # Pure geometry helpers (distance, route snapping)
 ├── requirements.txt                    # Python dependencies
 ├── README.md                           # This file
 ├── .gitignore                          # Protects secrets.toml
 └── .streamlit/
+    ├── config.toml                     # Theme color, toolbar
     └── secrets.toml.example            # Template — copy to secrets.toml
 ```
 
@@ -90,7 +100,9 @@ travel-places-finder/
 - **Three Google APIs** are used: Geocoding (free — address → lat/lng), Places API (New) (paid after free tier — the place lookup), and Routes API (paid after free tier — driving polylines).
 - **Results are cached** via `@st.cache_data` — 1 hour for geocoding/routes, 5 minutes for place searches. This both speeds up the app and saves API calls during iteration.
 - **The Places API (New) requires a field mask** (`X-Goog-FieldMask` header). The mask in `app.py` asks for only the fields used in the UI. Adding fields costs more per call; removing fields saves money.
-- **"Along a route" ordering** currently uses haversine distance from origin as a proxy for route position. For most routes this produces correct order; for routes with major bends a proper polyline snap would be better. Reasonable v1 simplification.
+- **"Along a drive" positions** snap each result onto the route polyline (`geo.locate_on_polyline`), giving both the straight-line distance off the road and the mile marker along it — so "Trip order" stays correct even on routes with big bends.
+- **"Near a place" stays inside the radius.** Text Search only accepts a rectangle as a hard restriction, so the app restricts to the circle's bounding box and then drops the corners with an exact distance check.
+- **Password cookie.** After a correct password, the app stores a hash of it in a cookie (`tpf_auth`) and reads it back with `st.context.cookies`. Changing `APP_PASSWORD` logs every browser out.
 
 ## Cost watch
 
@@ -105,5 +117,4 @@ For personal travel-planning use, you'll almost certainly stay inside the free t
 
 - Extract Google API calls into a FastAPI backend; keep API key off the client entirely.
 - Build a React PWA frontend against that backend for a real mobile experience.
-- Add natural-language parsing: let the user type "vegan dinner near my hotel tomorrow" and have Claude (via Anthropic API) parse intent → coordinates → search parameters.
 - Add trip-level context: save itineraries, pre-search all destinations on a multi-city trip.

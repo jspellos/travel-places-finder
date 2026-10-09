@@ -4,15 +4,23 @@ Travel Places Finder
 Find places (restaurants, shops, hotels, etc.) at destinations you're planning
 to visit — not just where you are now.
 
-Three search modes:
-  1. Near a location  - radius search around any address/landmark/hotel
-  2. Along a route    - search along the driving path between two points
+Two search modes:
+  1. Near a place     - radius search around any address/landmark/hotel
+  2. Along a drive    - search along the driving path between two points
 
 Uses Google Maps Platform:
-  - Geocoding API       (address -> lat/lng)
+  - Geocoding API       (address <-> lat/lng)
   - Places API (New)    (find places)
   - Routes API          (compute driving polylines)
 """
+
+import hashlib
+import hmac
+import html
+from datetime import datetime, timedelta, timezone
+from math import cos, radians
+from typing import Optional
+from urllib.parse import quote
 
 import streamlit as st
 import requests
@@ -20,8 +28,11 @@ import folium
 from streamlit_folium import st_folium
 import pandas as pd
 import polyline as polyline_lib
-from math import radians, cos, sin, asin, sqrt
-from typing import Optional
+
+from geo import (
+    haversine_miles, cumulative_miles, locate_on_polyline,
+    chunk_polyline, trim_polyline_start,
+)
 
 # Anthropic is optional — the app runs fine without it, the natural-language
 # shortcut just hides itself. Keeps the app working for anyone cloning the
@@ -32,14 +43,24 @@ try:
 except ImportError:
     _ANTHROPIC_AVAILABLE = False
 
+# Same idea for the "Use my location" button: it needs a small JS component.
+try:
+    from streamlit_js_eval import get_geolocation
+    _GEOLOCATION_AVAILABLE = True
+except ImportError:
+    _GEOLOCATION_AVAILABLE = False
+
 # -------------------- Config --------------------
 st.set_page_config(
     page_title="Travel Places Finder",
     page_icon="🗺️",
-    layout="wide",
+    layout="centered",
+    initial_sidebar_state="collapsed",
 )
 
-# Mobile CSS. Two things worth knowing:
+BRAND = "#0F766E"  # keep in sync with primaryColor in .streamlit/config.toml
+
+# Global CSS. Two things worth knowing:
 #   (1) st.html() bypasses Streamlit's markdown pipeline, which sometimes
 #       mangles CSS blocks (and was rendering a stray "}" at the top of the
 #       page when we used st.markdown).
@@ -47,41 +68,67 @@ st.set_page_config(
 #       be in <head>, not <body>. Streamlit Cloud already sets a correct
 #       viewport by default, so we don't need to re-add it.
 #
-# The real fix for mobile readability is containing horizontal overflow
-# (so the browser doesn't zoom out to fit) and then scaling fonts. Also
-# kills the huge top padding Streamlit applies on mobile by default.
-st.html("""
+# Colors in the result cards use inherit / translucent greys so they read
+# correctly in both Streamlit's light and dark themes.
+st.html(f"""
 <style>
-@media (max-width: 768px) {
+/* ---------- Result cards ---------- */
+.tpf-card {{
+    border: 1px solid rgba(128,128,128,.28);
+    border-radius: 14px;
+    padding: 14px 14px 12px 14px;
+    margin-bottom: 12px;
+}}
+.tpf-head {{ display: flex; gap: 10px; align-items: flex-start; }}
+.tpf-num {{
+    flex: none; width: 26px; height: 26px; border-radius: 50%;
+    background: {BRAND}; color: #fff; font-weight: 700; font-size: 14px;
+    display: flex; align-items: center; justify-content: center;
+    margin-top: 1px;
+}}
+.tpf-name {{
+    font-weight: 700; font-size: 1.05rem; line-height: 1.3;
+    color: inherit !important; text-decoration: none !important;
+}}
+.tpf-meta {{ font-size: .92rem; margin-top: 6px; }}
+.tpf-muted {{ opacity: .65; }}
+.tpf-open {{ color: #16A34A; font-weight: 600; }}
+.tpf-closed {{ color: #DC2626; font-weight: 600; }}
+.tpf-addr {{ font-size: .88rem; opacity: .7; margin-top: 4px; }}
+.tpf-actions {{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }}
+.tpf-btn {{
+    flex: 1 1 0; min-width: 88px; text-align: center;
+    padding: 9px 10px; border-radius: 10px;
+    border: 1px solid rgba(128,128,128,.35);
+    font-weight: 600; font-size: .92rem;
+    color: inherit !important; text-decoration: none !important;
+}}
+.tpf-btn.primary {{ background: {BRAND}; border-color: {BRAND}; color: #fff !important; }}
+.tpf-card details {{ margin-top: 10px; font-size: .85rem; }}
+.tpf-card summary {{ cursor: pointer; opacity: .75; }}
+.tpf-card details div {{ margin-top: 4px; opacity: .85; }}
+
+/* ---------- Phones ---------- */
+@media (max-width: 768px) {{
     /* Contain overflow — without this, font sizes don't matter because
        the browser zooms out to fit any over-wide element. */
-    html, body { overflow-x: hidden !important; }
-    div[data-testid="stAppViewContainer"] { overflow-x: hidden !important; }
-    .main .block-container {
+    html, body {{ overflow-x: hidden !important; }}
+    div[data-testid="stAppViewContainer"] {{ overflow-x: hidden !important; }}
+    .main .block-container, div[data-testid="stMainBlockContainer"] {{
         max-width: 100% !important;
-        padding: 0.5rem 0.75rem 1rem 0.75rem !important;
-    }
+        padding: 0.5rem 0.75rem 2rem 0.75rem !important;
+    }}
     /* Kill the ~6rem header spacer Streamlit inserts above content. */
-    header[data-testid="stHeader"] { height: 2.5rem !important; }
-    div[data-testid="stToolbar"] { top: 0.25rem !important; }
+    header[data-testid="stHeader"] {{ height: 2.5rem !important; }}
+    div[data-testid="stToolbar"] {{ top: 0.25rem !important; }}
 
-    /* Horizontal scroll stays inside the table, not the page. */
-    div[data-testid="stDataFrame"] {
-        max-width: 100% !important;
-        overflow-x: auto !important;
-    }
-
-    /* Base font. */
-    html { font-size: 17px !important; }
-    div[data-testid="stMarkdownContainer"] p,
-    div[data-testid="stMarkdownContainer"] li,
-    div[data-testid="stMarkdownContainer"] span { font-size: 17px !important; }
+    html {{ font-size: 17px !important; }}
 
     /* Inputs need 16px+ on iOS to prevent auto-zoom-on-focus.
        No-op on Android but doesn't hurt. */
     div[data-testid="stTextInput"] input,
     div[data-testid="stNumberInput"] input,
-    textarea { font-size: 17px !important; }
+    textarea {{ font-size: 17px !important; }}
 
     /* Headings: Streamlit's JS injects stylesheets AFTER our CSS loads, and
        those rules use data-testid selectors. To win the specificity race,
@@ -90,52 +137,87 @@ st.html("""
        Android Chrome — classic late-stylesheet symptom. */
     [data-testid="stMarkdownContainer"] h1,
     [data-testid="stHeading"] h1,
-    h1[data-testid="stHeading"] {
-        font-size: 1.75rem !important; line-height: 1.2 !important;
-        margin-top: 0.25rem !important; margin-bottom: 0.5rem !important;
+    h1[data-testid="stHeading"] {{
+        font-size: 1.6rem !important; line-height: 1.2 !important;
+        margin-top: 0.25rem !important; margin-bottom: 0.25rem !important;
         font-weight: 700 !important;
-    }
-    [data-testid="stMarkdownContainer"] h2,
-    [data-testid="stHeading"] h2,
-    h2[data-testid="stHeading"] {
-        font-size: 1.3rem !important; line-height: 1.25 !important;
-        margin-top: 1rem !important; margin-bottom: 0.5rem !important;
-    }
-    [data-testid="stMarkdownContainer"] h3,
-    [data-testid="stHeading"] h3,
-    h3[data-testid="stHeading"] {
-        font-size: 1.05rem !important; line-height: 1.3 !important;
-        color: #555 !important; font-weight: 600 !important;
-    }
+    }}
 
-    div[data-testid="stCaptionContainer"] p { font-size: 14px !important; }
-    label { font-size: 15px !important; }
-    div[data-testid="stAlert"] p { font-size: 16px !important; }
-    div[data-testid="stDataFrame"] * { font-size: 13px !important; }
-    div[data-testid="stSlider"] label { font-size: 15px !important; }
-    div[data-testid="stRadio"] label { font-size: 16px !important; }
-
-    /* Folium popups — inline styles in popup HTML are primary. */
-    .leaflet-popup-content { font-size: 14px !important; line-height: 1.5 !important; }
-}
+    div[data-testid="stCaptionContainer"] p {{ font-size: 14px !important; }}
+    label {{ font-size: 15px !important; }}
+    div[data-testid="stAlert"] p {{ font-size: 16px !important; }}
+}}
 </style>
 """)
 
-# Pull API key from Streamlit secrets. On Streamlit Cloud, set this in the
-# app's Secrets panel. Locally, put it in .streamlit/secrets.toml
-try:
-    API_KEY = st.secrets.get("GOOGLE_MAPS_API_KEY", "")
-except Exception:
-    API_KEY = ""
 
-# Anthropic key is optional — enables the natural-language shortcut.
-# Absence doesn't break the app, it just hides that feature.
-try:
-    ANTHROPIC_KEY = st.secrets.get("ANTHROPIC_API_KEY", "")
-except Exception:
-    ANTHROPIC_KEY = ""
+def _secret(name: str) -> str:
+    """Read a Streamlit secret, or "" if secrets aren't configured at all."""
+    try:
+        return st.secrets.get(name, "")
+    except Exception:
+        return ""
+
+
+# On Streamlit Cloud, set these in the app's Secrets panel. Locally, put them
+# in .streamlit/secrets.toml (see secrets.toml.example).
+API_KEY = _secret("GOOGLE_MAPS_API_KEY")
+ANTHROPIC_KEY = _secret("ANTHROPIC_API_KEY")  # optional — enables the shortcut
+APP_PASSWORD = _secret("APP_PASSWORD")        # optional — enables the lock screen
 
 SHORTCUT_ENABLED = bool(ANTHROPIC_KEY) and _ANTHROPIC_AVAILABLE
+
+
+# -------------------- Password gate --------------------
+
+# A deployed Streamlit app is public to anyone with the URL, and every search
+# spends the owner's Google (and Claude) quota. A shared password keeps the
+# link safe to text to a travel companion.
+#
+# "Remember this phone" works via a cookie holding a hash of the password:
+# st.context.cookies reads it on page load, and a tiny script writes it after
+# a successful login. Changing APP_PASSWORD invalidates every saved cookie.
+AUTH_COOKIE = "tpf_auth"
+
+
+def _auth_token(password: str) -> str:
+    return hashlib.sha256(f"travel-places-finder:{password}".encode()).hexdigest()
+
+
+def require_password():
+    """Show a lock screen and st.stop() until the right password is entered."""
+    if not APP_PASSWORD or st.session_state.get("authed"):
+        return
+
+    token = _auth_token(APP_PASSWORD)
+    if hmac.compare_digest(st.context.cookies.get(AUTH_COOKIE, ""), token):
+        st.session_state["authed"] = True
+        return
+
+    st.title("🗺️ Travel Places Finder")
+    with st.form("login"):
+        pw = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Unlock", type="primary", width="stretch")
+    if submitted:
+        if hmac.compare_digest(pw.encode(), APP_PASSWORD.encode()):
+            st.session_state["authed"] = True
+            st.session_state["write_auth_cookie"] = True
+            st.rerun()
+        st.error("That password didn't work.")
+    st.stop()
+
+
+require_password()
+
+# First run after login: save the cookie so this browser skips the lock
+# screen next time (one year).
+if st.session_state.pop("write_auth_cookie", False):
+    st.html(
+        "<script>document.cookie = '" + AUTH_COOKIE + "=" + _auth_token(APP_PASSWORD)
+        + "; max-age=31536000; path=/; SameSite=Lax'"
+        + " + (location.protocol === 'https:' ? '; Secure' : '');</script>",
+        unsafe_allow_javascript=True,
+    )
 
 if not API_KEY:
     st.error("⚠️ Google Maps API key not found.")
@@ -168,7 +250,10 @@ PLACES_FIELD_MASK = ",".join([
     "places.userRatingCount",
     "places.priceLevel",
     "places.regularOpeningHours.weekdayDescriptions",
+    "places.currentOpeningHours.openNow",
+    "places.utcOffsetMinutes",
     "places.nationalPhoneNumber",
+    "places.internationalPhoneNumber",
     "places.websiteUri",
     "places.types",
 ])
@@ -198,9 +283,32 @@ def geocode_address(address: str) -> Optional[dict]:
     }
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def reverse_geocode(lat: float, lng: float) -> Optional[str]:
+    """Turn the phone's GPS fix into a human-readable address."""
+    url = "https://maps.googleapis.com/maps/api/geocode/json"
+    params = {"latlng": f"{lat},{lng}", "key": API_KEY}
+    try:
+        data = requests.get(url, params=params, timeout=10).json()
+    except Exception:
+        return None
+    if data.get("status") != "OK" or not data.get("results"):
+        return None
+    return data["results"][0]["formatted_address"]
+
+
 @st.cache_data(ttl=300, show_spinner=False)
-def places_text_search(query: str, lat: float, lng: float, radius_meters: float) -> list:
-    """Text search near a location using Places API (New)."""
+def places_text_search(query: str, lat: float, lng: float, radius_miles: float) -> list:
+    """
+    Text search near a location using Places API (New).
+
+    Text Search only accepts a *rectangle* for locationRestriction (circles
+    are bias-only, which lets Google return places well outside the radius).
+    So we restrict to the circle's bounding box here, and the caller trims
+    the box's corners with an exact distance check.
+    """
+    dlat = radius_miles / 69.0
+    dlng = radius_miles / (69.0 * max(cos(radians(lat)), 0.01))
     url = "https://places.googleapis.com/v1/places:searchText"
     headers = {
         "Content-Type": "application/json",
@@ -209,10 +317,10 @@ def places_text_search(query: str, lat: float, lng: float, radius_meters: float)
     }
     body = {
         "textQuery": query,
-        "locationBias": {
-            "circle": {
-                "center": {"latitude": lat, "longitude": lng},
-                "radius": float(radius_meters),
+        "locationRestriction": {
+            "rectangle": {
+                "low":  {"latitude": lat - dlat, "longitude": lng - dlng},
+                "high": {"latitude": lat + dlat, "longitude": lng + dlng},
             }
         },
         "maxResultCount": 20,
@@ -299,161 +407,6 @@ def places_search_along_route(query: str, encoded_polyline: str) -> list:
 
 # -------------------- Data helpers --------------------
 
-def haversine_miles(lat1, lng1, lat2, lng2):
-    """Great-circle distance in miles."""
-    R = 3958.8
-    lat1, lng1, lat2, lng2 = map(radians, [lat1, lng1, lat2, lng2])
-    dlat, dlng = lat2 - lat1, lng2 - lng1
-    a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlng / 2) ** 2
-    return R * 2 * asin(sqrt(a))
-
-
-def point_to_polyline_miles(point_lat, point_lng, polyline_coords) -> Optional[float]:
-    """
-    Minimum straight-line distance in miles from a point to the nearest segment
-    of a polyline. `polyline_coords` is a list of (lat, lng) tuples.
-
-    Projects into a local flat plane using equirectangular projection with a
-    cos(latitude) correction for longitude. Accurate to well under 1% for the
-    few-miles-scale distances this app cares about. Returns None if inputs
-    are missing or the polyline is degenerate.
-
-    Caveat: this is crow-flies distance to the road, not actual driving detour.
-    A Starbucks 0.3 mi off the highway might be a 1.5 mi surface-street drive
-    to reach. For a "is this a reasonable detour" judgment, crow-flies is fine
-    and much cheaper than a second Routes API call per result.
-    """
-    if point_lat is None or point_lng is None:
-        return None
-    if not polyline_coords or len(polyline_coords) < 2:
-        return None
-
-    mi_per_deg_lat = 69.0
-    mi_per_deg_lng = 69.0 * cos(radians(point_lat))
-
-    # Translate so the query point sits at the origin of the local plane.
-    best = float("inf")
-    for i in range(len(polyline_coords) - 1):
-        lat1, lng1 = polyline_coords[i]
-        lat2, lng2 = polyline_coords[i + 1]
-        ax = (lng1 - point_lng) * mi_per_deg_lng
-        ay = (lat1 - point_lat) * mi_per_deg_lat
-        bx = (lng2 - point_lng) * mi_per_deg_lng
-        by = (lat2 - point_lat) * mi_per_deg_lat
-
-        abx, aby = bx - ax, by - ay
-        ab_sq = abx * abx + aby * aby
-        if ab_sq < 1e-12:
-            # Degenerate zero-length segment — fall back to distance from A.
-            dx, dy = -ax, -ay
-        else:
-            # Project point (at origin) onto segment AB, clamp parameter to [0,1]
-            # so the nearest point is on the segment, not its infinite extension.
-            t = (-ax * abx + -ay * aby) / ab_sq
-            t = max(0.0, min(1.0, t))
-            projx = ax + t * abx
-            projy = ay + t * aby
-            dx, dy = -projx, -projy
-
-        d = sqrt(dx * dx + dy * dy)
-        if d < best:
-            best = d
-
-    return round(best, 2)
-
-
-def chunk_polyline(coords, n_chunks: int, overlap_fraction: float = 0.05) -> list:
-    """
-    Split a polyline into n_chunks sub-polylines of roughly equal arc length,
-    with a small overlap between adjacent chunks.
-
-    Why: Google's searchAlongRoute returns up to 20 results ranked by their own
-    relevance. On long routes through dense areas, those 20 slots get consumed
-    near the origin before the algorithm reaches the destination end. Splitting
-    the polyline into chunks and querying each independently gives every
-    segment of the trip its own result budget.
-
-    Overlap prevents a result sitting exactly on a chunk boundary from falling
-    through the cracks of how Google treats segment endpoints.
-
-    Returns a list of (lat, lng) sublists, each suitable for re-encoding.
-    If the polyline is too short or n_chunks <= 1, returns [coords] unchanged.
-    """
-    if n_chunks <= 1 or len(coords) < 4:
-        return [coords]
-
-    # Cumulative arc length at each vertex, in miles.
-    cum = [0.0]
-    for i in range(1, len(coords)):
-        cum.append(cum[-1] + haversine_miles(
-            coords[i - 1][0], coords[i - 1][1],
-            coords[i][0],     coords[i][1],
-        ))
-    total = cum[-1]
-    if total < 1.0:  # sub-mile route — chunking is meaningless
-        return [coords]
-
-    chunk_len = total / n_chunks
-    overlap = chunk_len * overlap_fraction
-
-    chunks = []
-    for k in range(n_chunks):
-        start = max(0.0, k * chunk_len - overlap)
-        end   = min(total, (k + 1) * chunk_len + overlap)
-
-        # Find the vertex range that covers [start, end]. We want to include
-        # the last vertex at-or-before start and the first vertex at-or-after
-        # end, so the resulting sub-polyline fully spans the window.
-        start_idx = 0
-        while start_idx < len(cum) - 1 and cum[start_idx + 1] < start:
-            start_idx += 1
-        end_idx = len(coords) - 1
-        while end_idx > 0 and cum[end_idx - 1] > end:
-            end_idx -= 1
-
-        chunk = coords[start_idx:end_idx + 1]
-        if len(chunk) >= 2:
-            chunks.append(chunk)
-
-    return chunks if chunks else [coords]
-
-
-def trim_polyline_start(coords, skip_miles: float):
-    """
-    Return (trimmed_coords, skipped_miles) — the portion of the polyline
-    starting at approximately `skip_miles` of arc length from the origin.
-
-    Why: along-route search is for discovery mid-trip and toward the
-    destination. Results clustered near the origin are better served by the
-    "Near a location" mode. Skipping the first N miles lets the route mode
-    escape the dense origin area and focus on what's actually ahead.
-
-    If the route is too short to trim meaningfully (< skip + 5 mi), returns
-    (coords, 0.0) so the caller falls back to the full route.
-    """
-    if skip_miles <= 0 or len(coords) < 2:
-        return coords, 0.0
-
-    cum = [0.0]
-    for i in range(1, len(coords)):
-        cum.append(cum[-1] + haversine_miles(
-            coords[i - 1][0], coords[i - 1][1],
-            coords[i][0],     coords[i][1],
-        ))
-    total = cum[-1]
-    if total < skip_miles + 5:
-        return coords, 0.0  # trip too short to skip meaningfully
-
-    # First vertex at or past the skip threshold.
-    start_idx = 0
-    while start_idx < len(cum) and cum[start_idx] < skip_miles:
-        start_idx += 1
-    if start_idx >= len(coords):
-        return coords, 0.0  # safety fallback
-
-    return coords[start_idx:], cum[start_idx]
-
-
 PRICE_LEVELS = {
     "PRICE_LEVEL_FREE":           "Free",
     "PRICE_LEVEL_INEXPENSIVE":    "$",
@@ -461,6 +414,21 @@ PRICE_LEVELS = {
     "PRICE_LEVEL_EXPENSIVE":      "$$$",
     "PRICE_LEVEL_VERY_EXPENSIVE": "$$$$",
 }
+
+
+def todays_hours(place: dict) -> str:
+    """
+    Today's opening hours *in the place's own time zone*, e.g.
+    "7:00 AM – 9:00 PM". Google's weekdayDescriptions list starts on Monday,
+    which matches datetime.weekday().
+    """
+    desc = place.get("regularOpeningHours", {}).get("weekdayDescriptions", [])
+    offset = place.get("utcOffsetMinutes")
+    if len(desc) != 7 or offset is None:
+        return ""
+    local_now = datetime.now(timezone.utc) + timedelta(minutes=offset)
+    line = desc[local_now.weekday()]
+    return line.split(": ", 1)[1] if ": " in line else line
 
 
 def places_to_dataframe(places, center_lat=None, center_lng=None) -> pd.DataFrame:
@@ -472,8 +440,8 @@ def places_to_dataframe(places, center_lat=None, center_lng=None) -> pd.DataFram
         distance = None
         if center_lat is not None and lat is not None:
             distance = round(haversine_miles(center_lat, center_lng, lat, lng), 2)
-        hours = p.get("regularOpeningHours", {}).get("weekdayDescriptions", [])
         rows.append({
+            "id":            p.get("id", ""),
             "Name":          p.get("displayName", {}).get("text", "Unknown"),
             "Rating":        p.get("rating"),
             "Reviews":       p.get("userRatingCount"),
@@ -481,24 +449,139 @@ def places_to_dataframe(places, center_lat=None, center_lng=None) -> pd.DataFram
             "Distance (mi)": distance,
             "Address":       p.get("formattedAddress", ""),
             "Phone":         p.get("nationalPhoneNumber", ""),
+            "Dial":          p.get("internationalPhoneNumber", ""),
             "Website":       p.get("websiteUri", ""),
-            "Hours":         " | ".join(hours) if hours else "",
+            "Hours":         p.get("regularOpeningHours", {}).get("weekdayDescriptions", []),
+            "Today":         todays_hours(p),
+            "Open now":      p.get("currentOpeningHours", {}).get("openNow"),
             "lat":           lat,
             "lng":           lng,
         })
     return pd.DataFrame(rows)
 
 
+def maps_url(row) -> str:
+    """Google Maps listing for the place (opens the Maps app on phones)."""
+    return (f"https://www.google.com/maps/search/?api=1"
+            f"&query={quote(row['Name'] + ', ' + row['Address'])}"
+            f"&query_place_id={quote(row['id'])}")
+
+
+def directions_url(row) -> str:
+    """Turn-by-turn directions from wherever the phone is now."""
+    return (f"https://www.google.com/maps/dir/?api=1"
+            f"&destination={quote(row['Name'] + ', ' + row['Address'])}"
+            f"&destination_place_id={quote(row['id'])}")
+
+
+def _is_open(value) -> Optional[bool]:
+    """Normalise the 'Open now' cell — pandas turns missing values into NaN."""
+    return value if isinstance(value, bool) else None
+
+
+def filter_and_sort(df: pd.DataFrame, prefix: str, sort_options: dict) -> pd.DataFrame:
+    """
+    Render the filter row (open now, min rating, sort) and return the
+    filtered, sorted view. Filtering happens on stored results, so changing
+    a filter never triggers another API call.
+
+    `sort_options` maps a label to (columns, ascending) for sort_values.
+    """
+    with st.container(horizontal=True, vertical_alignment="center", gap="medium"):
+        open_only = st.toggle("Open now", key=f"{prefix}_open")
+        min_rating = st.segmented_control(
+            "Rating", ["Any", "4.0+", "4.5+"], default="Any",
+            key=f"{prefix}_rating", label_visibility="collapsed",
+        )
+        sort_label = st.selectbox(
+            "Sort", list(sort_options), key=f"{prefix}_sort",
+            label_visibility="collapsed", width=170,
+        )
+
+    view = df
+    if open_only:
+        view = view[view["Open now"].map(_is_open) == True]  # noqa: E712
+    if min_rating in ("4.0+", "4.5+"):
+        view = view[view["Rating"].fillna(0) >= float(min_rating.rstrip("+"))]
+    cols, ascending = sort_options[sort_label]
+    view = view.sort_values(cols, ascending=ascending, na_position="last")
+    return view.reset_index(drop=True)
+
+
+def render_cards(df: pd.DataFrame, distance_fn):
+    """
+    Result list as tappable cards. One st.html call for the whole list keeps
+    the page light on phones (vs. dozens of separate Streamlit widgets).
+
+    `distance_fn(row)` returns the mode-specific distance text, e.g.
+    "2.3 mi away" or "0.4 mi off route · mile 63".
+    """
+    esc = html.escape
+    parts = []
+    for i, row in df.iterrows():
+        meta = []
+        if pd.notna(row["Rating"]):
+            reviews = f" <span class='tpf-muted'>({int(row['Reviews']):,})</span>" \
+                if pd.notna(row["Reviews"]) else ""
+            meta.append(f"⭐ {row['Rating']:.1f}{reviews}")
+        if row["Price"]:
+            meta.append(esc(row["Price"]))
+        dist = distance_fn(row)
+        if dist:
+            meta.append(esc(dist))
+
+        status = []
+        is_open = _is_open(row["Open now"])
+        if is_open is True:
+            status.append("<span class='tpf-open'>Open now</span>")
+        elif is_open is False:
+            status.append("<span class='tpf-closed'>Closed now</span>")
+        if row["Today"]:
+            status.append(f"Today {esc(row['Today'])}")
+
+        buttons = [f"<a class='tpf-btn primary' href='{esc(directions_url(row))}' "
+                   f"target='_blank' rel='noopener'>Directions</a>"]
+        if row["Dial"] or row["Phone"]:
+            dial = "".join(c for c in (row["Dial"] or row["Phone"]) if c.isdigit() or c == "+")
+            buttons.append(f"<a class='tpf-btn' href='tel:{esc(dial)}'>Call</a>")
+        if str(row["Website"]).startswith(("http://", "https://")):
+            buttons.append(f"<a class='tpf-btn' href='{esc(row['Website'])}' "
+                           f"target='_blank' rel='noopener'>Website</a>")
+
+        hours = ""
+        if row["Hours"]:
+            hours = ("<details><summary>All hours</summary>"
+                     + "".join(f"<div>{esc(h)}</div>" for h in row["Hours"])
+                     + "</details>")
+
+        parts.append(
+            "<div class='tpf-card'>"
+            "<div class='tpf-head'>"
+            f"<span class='tpf-num'>{i + 1}</span>"
+            f"<a class='tpf-name' href='{esc(maps_url(row))}' target='_blank' "
+            f"rel='noopener'>{esc(row['Name'])}</a>"
+            "</div>"
+            + (f"<div class='tpf-meta'>{' · '.join(meta)}</div>" if meta else "")
+            + (f"<div class='tpf-meta'>{' · '.join(status)}</div>" if status else "")
+            + f"<div class='tpf-addr'>{esc(row['Address'])}</div>"
+            + f"<div class='tpf-actions'>{''.join(buttons)}</div>"
+            + hours
+            + "</div>"
+        )
+    st.html("".join(parts))
+
+
 def render_map(df, center_lat, center_lng, center_label="Search center",
                polyline_str=None, endpoint_markers=None):
-    """Build a Folium map with center, results, and optional route."""
+    """Build a Folium map with center, numbered results, and optional route."""
     m = folium.Map(location=[center_lat, center_lng], zoom_start=11)
+    esc = html.escape
 
     # Center marker (red star) — only show when it's a meaningful anchor
     if center_label and not endpoint_markers:
         folium.Marker(
             [center_lat, center_lng],
-            popup=center_label,
+            popup=esc(center_label),
             icon=folium.Icon(color="red", icon="star", prefix="fa"),
         ).add_to(m)
 
@@ -507,51 +590,47 @@ def render_map(df, center_lat, center_lng, center_label="Search center",
         for label, lat, lng, color in endpoint_markers:
             folium.Marker(
                 [lat, lng],
-                popup=label,
+                popup=esc(label),
                 icon=folium.Icon(color=color, icon="flag", prefix="fa"),
             ).add_to(m)
 
     # Route polyline
     if polyline_str:
         coords = polyline_lib.decode(polyline_str)
-        folium.PolyLine(coords, color="#1f77b4", weight=4, opacity=0.6).add_to(m)
+        folium.PolyLine(coords, color=BRAND, weight=5, opacity=0.6).add_to(m)
 
-    # Result markers
-    for _, row in df.iterrows():
-        if pd.notna(row.get("lat")) and pd.notna(row.get("lng")):
-            # Inline styles here are load-bearing: Folium popups render in a
-            # Leaflet div that doesn't reliably inherit the parent page's CSS,
-            # so the @media query from main app CSS can't be trusted alone.
-            popup_html = (
-                "<div style='font-size:14px;line-height:1.5;min-width:220px;"
-                "font-family:-apple-system,BlinkMacSystemFont,sans-serif;'>"
-            )
-            popup_html += f"<b style='font-size:15px;'>{row['Name']}</b><br>"
-            if pd.notna(row.get("Rating")):
-                popup_html += f"⭐ {row['Rating']} ({int(row['Reviews'])} reviews)<br>"
-            if row.get("Price"):
-                popup_html += f"Price: {row['Price']}<br>"
-            # Distance: prefer "Off route" (route mode), else "Distance" (near mode).
-            off_route = row.get("Off route (mi)")
-            distance = row.get("Distance (mi)")
-            if pd.notna(off_route):
-                popup_html += f"🛣️ <b>{off_route} mi</b> off route<br>"
-            elif pd.notna(distance):
-                popup_html += f"📍 {distance} mi away<br>"
-            popup_html += f"{row['Address']}<br>"
-            if row.get("Phone"):
-                popup_html += f"📞 {row['Phone']}<br>"
-            if row.get("Website"):
-                popup_html += (
-                    f"<a href='{row['Website']}' target='_blank' "
-                    f"style='font-size:14px;'>Website</a>"
-                )
-            popup_html += "</div>"
-            folium.Marker(
-                [row["lat"], row["lng"]],
-                popup=folium.Popup(popup_html, max_width=320),
-                icon=folium.Icon(color="blue"),
-            ).add_to(m)
+    # Result markers, numbered to match the cards in the List tab.
+    for i, row in df.iterrows():
+        if pd.isna(row.get("lat")) or pd.isna(row.get("lng")):
+            continue
+        # Inline styles here are load-bearing: Folium renders in its own
+        # iframe, so the page's CSS can't reach popups or pins.
+        popup_html = (
+            "<div style='font-size:14px;line-height:1.5;min-width:200px;"
+            "font-family:-apple-system,BlinkMacSystemFont,sans-serif;'>"
+            f"<b style='font-size:15px;'>{i + 1}. {esc(row['Name'])}</b><br>"
+        )
+        if pd.notna(row.get("Rating")):
+            reviews = f" ({int(row['Reviews'])})" if pd.notna(row.get("Reviews")) else ""
+            popup_html += f"⭐ {row['Rating']}{reviews}<br>"
+        popup_html += f"{esc(row['Address'])}<br>"
+        popup_html += (
+            f"<a href='{esc(directions_url(row))}' target='_blank' "
+            f"style='font-weight:600;color:{BRAND};'>Directions</a>"
+            "</div>"
+        )
+        pin = (
+            f"<div style='background:{BRAND};color:#fff;border:2px solid #fff;"
+            "border-radius:50%;width:28px;height:28px;display:flex;"
+            "align-items:center;justify-content:center;font:700 13px sans-serif;"
+            f"box-shadow:0 1px 4px rgba(0,0,0,.4);'>{i + 1}</div>"
+        )
+        folium.Marker(
+            [row["lat"], row["lng"]],
+            popup=folium.Popup(popup_html, max_width=280),
+            tooltip=esc(row["Name"]),
+            icon=folium.DivIcon(html=pin, icon_size=(28, 28), icon_anchor=(14, 14)),
+        ).add_to(m)
 
     # Fit bounds to everything
     all_lats, all_lngs = [center_lat], [center_lng]
@@ -570,24 +649,99 @@ def render_map(df, center_lat, center_lng, center_label="Search center",
     return m
 
 
-def results_table(df):
-    """Render the details table with consistent formatting."""
-    # Show up to ~18 rows before scrolling. Streamlit rows are roughly 35px
-    # plus a 38px header; cap at 18 so the table doesn't dominate the page
-    # on short result sets and doesn't sprawl endlessly on long ones.
-    visible_rows = min(len(df), 18)
-    table_height = visible_rows * 35 + 38
-    st.dataframe(
-        df[["Name", "Rating", "Reviews", "Price", "Distance (mi)",
-            "Address", "Phone", "Website", "Hours"]],
-        use_container_width=True,
-        hide_index=True,
-        height=table_height,
-        column_config={
-            "Website": st.column_config.LinkColumn("Website"),
-            "Rating":  st.column_config.NumberColumn("⭐", format="%.1f"),
-        },
+def announce_results(count: int):
+    """
+    Call right after a successful search. The results render below the form,
+    which on a phone (or a short laptop window) is off-screen — so without a
+    signal it looks like Search did nothing. A toast is always visible.
+    """
+    st.session_state["scroll_to_results"] = True
+    st.session_state["search_n"] = st.session_state.get("search_n", 0) + 1
+    st.toast(f"Found {count} place{'s' if count != 1 else ''} — showing results below", icon="✅")
+
+
+def scroll_to_results():
+    """
+    After a fresh search, scroll the page down to the results.
+
+    The search number goes into the HTML so every search produces new markup;
+    identical markup would be reused by Streamlit without re-running the
+    script, and later searches wouldn't scroll. The script retries for a
+    couple of seconds because the results may still be drawing.
+    """
+    if st.session_state.pop("scroll_to_results", False):
+        anchor = f"tpf-results-{st.session_state.get('search_n', 0)}"
+        st.html(
+            f"<div id='{anchor}'></div><script>(function () {{"
+            "var tries = 0;"
+            "(function go() {"
+            f"  var el = document.getElementById('{anchor}');"
+            "  if (el) { el.scrollIntoView({behavior: 'smooth', block: 'start'}); return; }"
+            "  if (++tries < 15) setTimeout(go, 200);"
+            "})();"
+            "}());</script>",
+            unsafe_allow_javascript=True,
+        )
+
+
+def show_results(df_view, total, map_fn, distance_fn, map_key):
+    """List / Map view of a filtered result set."""
+    if df_view.empty:
+        st.info("No places match these filters.")
+        return
+    if len(df_view) < total:
+        st.caption(f"Showing {len(df_view)} of {total} after filters")
+
+    # A switch rather than st.tabs: Leaflet can't measure a map drawn inside
+    # a hidden tab, so fit_bounds zooms all the way in. Drawing the map only
+    # when it's visible fixes that, and keeps the List view light on phones.
+    view = st.segmented_control(
+        "View", ["📋 List", "🗺️ Map"], default="📋 List",
+        key=f"{map_key}_view", label_visibility="collapsed",
     )
+    if view == "🗺️ Map":
+        st_folium(map_fn(df_view), height=440, use_container_width=True,
+                  returned_objects=[], key=map_key)
+    else:
+        render_cards(df_view, distance_fn)
+
+
+# -------------------- "Use my location" --------------------
+
+# The browser's GPS fix arrives asynchronously: the button sets a flag, the
+# JS component asks the browser, and Streamlit reruns once it answers. Each
+# press gets a fresh component key so a second press asks again.
+#
+# The consume step must run *before* the target text_input is created in a
+# script run — Streamlit forbids writing a widget's state after it exists.
+
+def _request_location(target_key: str):
+    st.session_state[f"geo_n_{target_key}"] = st.session_state.get(f"geo_n_{target_key}", 0) + 1
+    st.session_state[f"geo_pending_{target_key}"] = True
+
+
+def consume_location(target_key: str):
+    if not st.session_state.get(f"geo_pending_{target_key}"):
+        return
+    n = st.session_state.get(f"geo_n_{target_key}", 0)
+    pos = get_geolocation(component_key=f"geo_{target_key}_{n}")
+    if pos is None:
+        st.caption("📍 Getting your location… (allow location access if asked)")
+        return
+    st.session_state[f"geo_pending_{target_key}"] = False
+    coords = pos.get("coords") if isinstance(pos, dict) else None
+    if not coords:
+        st.warning("Couldn't get your location. Check that location access "
+                   "is allowed for this site in your browser settings.")
+        return
+    lat, lng = coords["latitude"], coords["longitude"]
+    st.session_state[target_key] = reverse_geocode(lat, lng) or f"{lat:.5f},{lng:.5f}"
+
+
+def location_button(target_key: str):
+    if _GEOLOCATION_AVAILABLE:
+        st.button("📍 Use my location", key=f"geo_btn_{target_key}", type="tertiary",
+                  on_click=_request_location, args=(target_key,))
 
 
 # -------------------- Natural-language parser --------------------
@@ -675,25 +829,28 @@ def parse_with_claude(user_text: str) -> Optional[dict]:
     Ask Claude to parse a natural-language request into search parameters.
     Returns the tool input dict, or None on any failure (network, parse, etc.).
 
-    Uses Claude Haiku — this is a small, structured parsing task that doesn't
-    need Sonnet/Opus. Costs a fraction of a cent per call.
+    Uses Claude Haiku at low effort — this is a small, structured parsing
+    task. Costs a fraction of a cent per call.
     """
     if not SHORTCUT_ENABLED or not user_text.strip():
         return None
     try:
         client = Anthropic(api_key=ANTHROPIC_KEY)
         response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=512,
+            model="claude-haiku-5-5",
+            max_tokens=1024,
             system=PARSE_SYSTEM_PROMPT,
             tools=[PARSE_TOOL],
             tool_choice={"type": "tool", "name": "parse_travel_request"},
+            output_config={"effort": "low"},
             messages=[{"role": "user", "content": user_text}],
         )
     except Exception as e:
         st.error(f"Parse error: {e}")
         return None
 
+    if response.stop_reason == "refusal":
+        return None
     # Find the tool_use block in the response — with tool_choice forcing a
     # specific tool, there should be exactly one.
     for block in response.content:
@@ -704,19 +861,19 @@ def parse_with_claude(user_text: str) -> Optional[dict]:
 
 # -------------------- UI --------------------
 
+MODE_NEAR = "📍 Near a place"
+MODE_ROUTE = "🛣️ Along a drive"
+
 st.title("🗺️ Travel Places Finder")
-st.caption("Find places at destinations you're planning to visit — not just where you are now.")
+st.caption("Find places where you're *going* — not just where you are.")
 
 # Natural-language shortcut: one box that fills in the form below via
-# Claude. Populates session_state so existing widgets pick up the values
-# on the next rerun. User can tweak anything before hitting Search.
+# Claude, then runs the search. Populates session_state so existing widgets
+# pick up the values on the next rerun.
 if SHORTCUT_ENABLED:
     shortcut_text = st.text_input(
-        "💬 Or describe what you want in plain English",
-        placeholder=(
-            "e.g. 'vegan dinner near Hilton Garden Inn Tarrytown' — or — "
-            "'Starbucks from Bayside NY to Philadelphia, skip the first 30 miles'"
-        ),
+        "💬 Ask in plain English",
+        placeholder="vegan dinner near Hilton Garden Inn Tarrytown",
         key="shortcut_text",
     )
 
@@ -734,15 +891,15 @@ if SHORTCUT_ENABLED:
             # Populate the appropriate mode's form fields. Widgets below
             # read from these session_state keys on render.
             if parsed.get("mode") == "near_location":
-                st.session_state["search_mode_radio"] = "📍 Near a location"
+                st.session_state["mode"] = MODE_NEAR
                 if parsed.get("location"):
                     st.session_state["near_location"] = parsed["location"]
                 if parsed.get("query"):
                     st.session_state["near_query"] = parsed["query"]
                 if parsed.get("radius_miles"):
-                    st.session_state["near_radius"] = int(parsed["radius_miles"])
+                    st.session_state["near_radius"] = max(1, min(50, int(parsed["radius_miles"])))
             elif parsed.get("mode") == "along_route":
-                st.session_state["search_mode_radio"] = "🛣️ Along a route"
+                st.session_state["mode"] = MODE_ROUTE
                 if parsed.get("origin"):
                     st.session_state["route_origin"] = parsed["origin"]
                 if parsed.get("destination"):
@@ -750,72 +907,59 @@ if SHORTCUT_ENABLED:
                 if parsed.get("query"):
                     st.session_state["route_query"] = parsed["query"]
                 if parsed.get("skip_first_miles") is not None:
-                    st.session_state["route_skip"] = int(parsed["skip_first_miles"])
-            # Rerun so the mode radio and widgets below pick up the new state.
+                    skip = int(parsed["skip_first_miles"])
+                    st.session_state["route_skip"] = max(0, min(50, round(skip / 5) * 5))
+            # Search straight away — on a phone, every saved tap counts. The
+            # form still shows what was understood, so it's easy to adjust.
+            st.session_state["auto_search"] = True
             st.rerun()
-
-    # Soft-mode confirmation: show what Claude interpreted, so the user can
-    # spot mistakes before the Google API call. Persists across reruns.
-    if "shortcut_parsed" in st.session_state:
-        p = st.session_state["shortcut_parsed"]
-        if p.get("mode") == "near_location":
-            summary = (
-                f"📍 **Near a location** · *{p.get('query', '')}* "
-                f"near **{p.get('location', '?')}** "
-                f"within {p.get('radius_miles', 10)} miles"
-            )
         else:
-            skip = p.get("skip_first_miles", 25)
-            skip_note = f" · skip first {skip} mi" if skip else ""
-            summary = (
-                f"🛣️ **Along a route** · *{p.get('query', '')}* "
-                f"from **{p.get('origin', '?')}** "
-                f"to **{p.get('destination', '?')}**{skip_note}"
-            )
-        st.info(f"Interpreted as — {summary}  \n*Adjust the fields below if needed, then Search.*")
+            st.warning("Couldn't understand that — try the form below.")
 
-mode = st.sidebar.radio(
-    "Search mode",
-    ["📍 Near a location", "🛣️ Along a route"],
-    key="search_mode_radio",
-    help=(
-        "Near a location: find places within X miles of a destination, hotel, "
-        "or landmark. Along a route: find places on the drive between two points."
-    ),
+
+# Mode switch. segmented_control can be clicked "off" (returns None), so a
+# callback snaps it back to the last real choice.
+def _keep_mode():
+    if st.session_state.get("mode") is None:
+        st.session_state["mode"] = st.session_state.get("mode_prev", MODE_NEAR)
+    st.session_state["mode_prev"] = st.session_state["mode"]
+
+
+if st.session_state.get("mode") is None:
+    st.session_state["mode"] = st.session_state.get("mode_prev", MODE_NEAR)
+mode = st.segmented_control(
+    "Search mode", [MODE_NEAR, MODE_ROUTE], key="mode",
+    on_change=_keep_mode, label_visibility="collapsed", width="stretch",
 )
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("**Why this exists**")
-st.sidebar.caption(
-    "Google Maps excels at 'what's near me right now' but struggles with "
-    "'what's near where I'll be next Tuesday.' This fills that gap."
-)
+st.session_state["mode_prev"] = mode
 
 
-# -------- Mode 1: Near a location --------
-if mode == "📍 Near a location":
-    st.subheader("Find places near a location")
+# -------- Mode 1: Near a place --------
+if mode == MODE_NEAR:
+    consume_location("near_location")
+    location = st.text_input(
+        "Where",
+        placeholder="Ossining, NY  —  or  —  Hilton Garden Inn Tarrytown",
+        key="near_location",
+    )
+    location_button("near_location")
+    query = st.text_input(
+        "Looking for",
+        placeholder="vegan restaurants, coffee, pharmacy…",
+        key="near_query",
+    )
+    # Defaults live in session_state (not the widget's `value=`) because the
+    # plain-English shortcut also writes these keys — passing both makes
+    # Streamlit show a warning.
+    st.session_state.setdefault("near_radius", 10)
+    radius_miles = st.slider("Within (miles)", 1, 50, key="near_radius")
 
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        location = st.text_input(
-            "Location (city, address, hotel name, or landmark)",
-            placeholder="Ossining, NY  —  or  —  Hilton Garden Inn Tarrytown",
-            key="near_location",
-        )
-        query = st.text_input(
-            "What are you looking for?",
-            placeholder="vegan restaurants, Whole Foods, coffee shops, bookstores…",
-            key="near_query",
-        )
-    with col2:
-        radius_miles = st.slider("Within (miles)", 1, 50, 20, key="near_radius")
-
+    clicked = st.button("🔍 Search", type="primary", key="near_search", width="stretch")
     # When Search is pressed, do the work and stash results in session_state
     # so they survive the reruns that Streamlit triggers on any UI interaction.
-    if st.button("🔍 Search", type="primary", key="near_search"):
+    if clicked or st.session_state.pop("auto_search", False):
         if not location or not query:
-            st.warning("Please fill in both location and search query.")
+            st.warning("Please fill in both where and what.")
         else:
             with st.spinner(f"Looking up '{location}'…"):
                 geo = geocode_address(location)
@@ -824,74 +968,80 @@ if mode == "📍 Near a location":
                 st.stop()
 
             with st.spinner(f"Searching for '{query}' within {radius_miles} miles…"):
-                places = places_text_search(
-                    query, geo["lat"], geo["lng"], radius_miles * 1609.34
-                )
+                places = places_text_search(query, geo["lat"], geo["lng"], radius_miles)
 
-            if not places:
-                st.warning("No results found. Try a wider radius or different query.")
+            df = places_to_dataframe(places, geo["lat"], geo["lng"])
+            if not df.empty:
+                # Trim the corners of the search rectangle back to a circle.
+                df = df[df["Distance (mi)"] <= radius_miles].reset_index(drop=True)
+
+            if df.empty:
+                st.warning("No results found. Try a wider radius or a different search.")
                 st.session_state.pop("near_results", None)  # clear any stale results
             else:
-                df = places_to_dataframe(places, geo["lat"], geo["lng"])
-                df = df.sort_values("Distance (mi)").reset_index(drop=True)
                 st.session_state["near_results"] = {
                     "geo": geo,
                     "df": df,
                     "query": query,
                     "radius": radius_miles,
                 }
+                announce_results(len(df))
 
     # Render from session_state (survives reruns from map interactions, tab
     # switches, etc.). Nothing renders until the first successful search.
     if "near_results" in st.session_state:
         res = st.session_state["near_results"]
-        st.success(f"📍 {res['geo']['formatted_address']}")
-        st.success(f"Found {len(res['df'])} result(s) for '{res['query']}' "
-                   f"within {res['radius']} miles — sorted by distance")
+        st.divider()
+        scroll_to_results()
+        st.markdown(
+            f"**{len(res['df'])} places** for “{res['query']}” within "
+            f"{res['radius']} mi of {res['geo']['formatted_address']}"
+        )
+        df_view = filter_and_sort(res["df"], "near", {
+            "Closest":   (["Distance (mi)"], [True]),
+            "Top rated": (["Rating", "Reviews"], [False, False]),
+        })
+        show_results(
+            df_view, len(res["df"]),
+            map_fn=lambda d: render_map(d, res["geo"]["lat"], res["geo"]["lng"],
+                                        center_label=res["geo"]["formatted_address"]),
+            distance_fn=lambda r: f"{r['Distance (mi)']:.1f} mi away"
+                                  if pd.notna(r["Distance (mi)"]) else "",
+            map_key="near_map",
+        )
 
-        tab_map, tab_table = st.tabs(["🗺️ Map", "📋 Details"])
-        with tab_map:
-            m = render_map(res["df"], res["geo"]["lat"], res["geo"]["lng"],
-                           center_label=res["geo"]["formatted_address"])
-            st_folium(m, height=600, use_container_width=True,
-                      returned_objects=[], key="near_map")
-        with tab_table:
-            results_table(res["df"])
 
-
-# -------- Mode 2: Along a route --------
-elif mode == "🛣️ Along a route":
-    st.subheader("Find places along a driving route")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        origin = st.text_input("From", placeholder="Queens, NY", key="route_origin")
-    with col2:
-        destination = st.text_input("To", placeholder="Croton-on-Hudson, NY", key="route_dest")
-
+# -------- Mode 2: Along a drive --------
+elif mode == MODE_ROUTE:
+    consume_location("route_origin")
+    origin = st.text_input("From", placeholder="Queens, NY", key="route_origin")
+    location_button("route_origin")
+    destination = st.text_input("To", placeholder="Croton-on-Hudson, NY", key="route_dest")
     query = st.text_input(
-        "What are you looking for along the way?",
-        placeholder="Starbucks, Whole Foods, charging stations, rest stops…",
+        "Looking for along the way",
+        placeholder="Starbucks, gas, EV charging, rest stop…",
         key="route_query",
     )
 
     # Route mode is for discovery mid-trip and toward the destination. The
-    # "Near a location" mode covers the origin area. Default 25 mi — tunable
+    # "Near a place" mode covers the origin area. Default 25 mi — tunable
     # because "25 mi out of Manhattan" ≠ "25 mi out of Poughkeepsie."
+    st.session_state.setdefault("route_skip", 25)
     skip_miles = st.slider(
-        "Skip first N miles",
-        min_value=0, max_value=50, value=25, step=5,
+        "Skip the first … miles",
+        min_value=0, max_value=50, step=5,
         key="route_skip",
-        help=("Exclude results clustered near your origin — use "
-              "'Near a location' mode for those. This mode is for what's "
+        help=("Leave out places near your starting point — use "
+              "'Near a place' for those. This mode is for what's "
               "ahead on your trip."),
     )
 
-    if st.button("🔍 Search", type="primary", key="route_search"):
+    clicked = st.button("🔍 Search", type="primary", key="route_search", width="stretch")
+    if clicked or st.session_state.pop("auto_search", False):
         if not origin or not destination or not query:
-            st.warning("Please fill in all three fields.")
+            st.warning("Please fill in From, To, and what you're looking for.")
         else:
-            with st.spinner("Geocoding origin and destination…"):
+            with st.spinner("Finding your start and end points…"):
                 origin_geo = geocode_address(origin)
                 dest_geo = geocode_address(destination)
 
@@ -955,39 +1105,21 @@ elif mode == "🛣️ Along a route":
                 mid_lat = (origin_geo["lat"] + dest_geo["lat"]) / 2
                 mid_lng = (origin_geo["lng"] + dest_geo["lng"]) / 2
 
-                df = places_to_dataframe(places, mid_lat, mid_lng)
-
-                # Decode the route polyline once and compute each result's
-                # perpendicular distance to the nearest segment. This answers
-                # "how far off the highway is this?" — the actual question
-                # a driver has when considering a detour.
-                route_coords = polyline_lib.decode(route["polyline"])
-                df["Off route (mi)"] = df.apply(
-                    lambda r: point_to_polyline_miles(
-                        r["lat"], r["lng"], route_coords
-                    ) if pd.notna(r["lat"]) else None,
-                    axis=1,
-                )
-
-                # Also track distance from origin as a rough "where along the
-                # trip is this" indicator. Not a sort key anymore, just context.
-                df["From origin (mi)"] = df.apply(
-                    lambda r: round(haversine_miles(
-                        origin_geo["lat"], origin_geo["lng"],
-                        r["lat"], r["lng"],
-                    ), 2) if pd.notna(r["lat"]) else None,
-                    axis=1,
-                )
-
-                # The haversine-from-midpoint "Distance (mi)" that
-                # places_to_dataframe computed is meaningless here.
-                df = df.drop(columns=["Distance (mi)"])
-
-                # Primary sort: minimize detour. Near-zero-off-route results
-                # bubble to the top — exactly what a driver on the highway wants.
-                df = df.sort_values(
-                    "Off route (mi)", na_position="last"
-                ).reset_index(drop=True)
+                # The haversine-from-center "Distance (mi)" is meaningless
+                # here; snap each result onto the route instead. That gives
+                # both "how far off the highway is this?" (the question a
+                # driver has when considering a detour) and "how far into the
+                # trip is it?" — measured along the road, so bends in the
+                # route don't scramble the order.
+                df = places_to_dataframe(places)
+                cum = cumulative_miles(route_coords)
+                located = [
+                    locate_on_polyline(lat, lng, route_coords, cum)
+                    if pd.notna(lat) else (None, None)
+                    for lat, lng in zip(df["lat"], df["lng"])
+                ]
+                df["Off route (mi)"] = [off for off, _ in located]
+                df["Mile"] = [along for _, along in located]
 
                 st.session_state["route_results"] = {
                     "origin_geo": origin_geo,
@@ -1000,6 +1132,10 @@ elif mode == "🛣️ Along a route":
                     "skipped_miles": skipped,
                     "skip_requested": skip_miles,
                 }
+                # New result set → the detour slider's range changes; drop
+                # its old value so it resets to the new default.
+                st.session_state.pop("route_detour_limit", None)
+                announce_results(len(df))
 
     # Render from session_state
     if "route_results" in st.session_state:
@@ -1008,20 +1144,17 @@ elif mode == "🛣️ Along a route":
         miles = res["route"]["distance_meters"] / 1609.34
         skipped = res.get("skipped_miles", 0)
         skip_requested = res.get("skip_requested", 0)
+        drive = f"{minutes // 60} h {minutes % 60} min" if minutes >= 60 else f"{minutes} min"
 
+        st.divider()
+        scroll_to_results()
         if skipped > 0:
-            st.success(
-                f"🛣️ Route: {miles:.1f} mi · ~{minutes} min driving · "
-                f"searched last {miles - skipped:.0f} mi "
-                f"(skipped first {skipped:.0f})"
-            )
+            skip_text = f" · skipped first {skipped:.0f} mi"
         elif skip_requested > 0:
-            st.info(
-                f"🛣️ Route: {miles:.1f} mi · ~{minutes} min driving · "
-                f"too short to skip {skip_requested} mi — searched entire route"
-            )
+            skip_text = " · trip too short to skip, searched the whole way"
         else:
-            st.success(f"🛣️ Route: {miles:.1f} mi · ~{minutes} min driving")
+            skip_text = ""
+        st.markdown(f"🛣️ **{miles:.0f} mi** · about {drive} driving{skip_text}")
 
         df_all = res["df"]
 
@@ -1037,24 +1170,32 @@ elif mode == "🛣️ Along a route":
                 max_value=slider_max,
                 value=default_val,
                 step=0.1,
+                format="%.1f",
                 key="route_detour_limit",
-                help=("Filter out results that would require driving further off "
-                      "the route. Straight-line distance to the road, not actual "
+                help=("Hide places farther off the route than this. "
+                      "Straight-line distance to the road, not actual "
                       "driving detour."),
             )
-            df_view = df_all[df_all["Off route (mi)"] <= detour_limit].reset_index(drop=True)
+            df_in_range = df_all[df_all["Off route (mi)"] <= detour_limit]
         else:
-            df_view = df_all
+            df_in_range = df_all
 
-        st.success(
-            f"Showing {len(df_view)} of {len(df_all)} result(s) for "
-            f"'{res['query']}' — sorted by detour distance"
-        )
+        st.markdown(f"**{len(df_in_range)} of {len(df_all)} places** for “{res['query']}”")
+        df_view = filter_and_sort(df_in_range, "route", {
+            "Least detour": (["Off route (mi)"], [True]),
+            "Trip order":   (["Mile"], [True]),
+            "Top rated":    (["Rating", "Reviews"], [False, False]),
+        })
 
-        tab_map, tab_table = st.tabs(["🗺️ Map", "📋 Details"])
-        with tab_map:
-            m = render_map(
-                df_view,
+        def route_distance(r):
+            if pd.isna(r["Off route (mi)"]):
+                return ""
+            return f"{r['Off route (mi)']:.1f} mi off route · mile {r['Mile']:.0f}"
+
+        show_results(
+            df_view, len(df_in_range),
+            map_fn=lambda d: render_map(
+                d,
                 res["mid_lat"], res["mid_lng"],
                 center_label=None,
                 polyline_str=res["route"]["polyline"],
@@ -1064,27 +1205,7 @@ elif mode == "🛣️ Along a route":
                     (f"End: {res['dest_geo']['formatted_address']}",
                      res["dest_geo"]["lat"], res["dest_geo"]["lng"], "darkred"),
                 ],
-            )
-            st_folium(m, height=600, use_container_width=True,
-                      returned_objects=[], key="route_map")
-        with tab_table:
-            visible_rows = min(len(df_view), 18)
-            table_height = visible_rows * 35 + 38
-            st.dataframe(
-                df_view[["Name", "Rating", "Reviews", "Price",
-                         "Off route (mi)", "From origin (mi)",
-                         "Address", "Phone", "Website", "Hours"]],
-                use_container_width=True,
-                hide_index=True,
-                height=table_height,
-                column_config={
-                    "Website": st.column_config.LinkColumn("Website"),
-                    "Rating":  st.column_config.NumberColumn("⭐", format="%.1f"),
-                    "Off route (mi)":   st.column_config.NumberColumn(
-                        "Off route (mi)", format="%.2f"
-                    ),
-                    "From origin (mi)": st.column_config.NumberColumn(
-                        "From origin (mi)", format="%.2f"
-                    ),
-                },
-            )
+            ),
+            distance_fn=route_distance,
+            map_key="route_map",
+        )

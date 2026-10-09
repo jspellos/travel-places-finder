@@ -1,0 +1,12 @@
+# Teal accent used for buttons, toggles, and map pins (keep in sync with
+# BRAND in app.py). Setting it per mode, rather than under a plain [theme],
+# keeps both light and dark available — the app follows the device setting.
+[theme.light]
+primaryColor = "#0F766E"
+
+[theme.dark]
+primaryColor = "#0F766E"
+
+[client]
+# Hide the developer menu items for people just using the app.
+toolbarMode = "minimal"

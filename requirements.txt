@@ -1,7 +1,8 @@
-streamlit>=1.28.0
+streamlit>=1.50.0
 requests>=2.31.0
 folium>=0.15.0
 streamlit-folium>=0.15.0
 pandas>=2.0.0
 polyline>=2.0.0
 anthropic
+streamlit-js-eval>=1.0.0
