@@ -43,12 +43,13 @@ try:
 except ImportError:
     _ANTHROPIC_AVAILABLE = False
 
-# Same idea for the "Use my location" button: it needs a small JS component.
+# Same idea for the small JS component behind "Use my location" and the
+# "remember this phone" login storage.
 try:
-    from streamlit_js_eval import get_geolocation
-    _GEOLOCATION_AVAILABLE = True
+    from streamlit_js_eval import get_geolocation, streamlit_js_eval
+    _JS_EVAL_AVAILABLE = True
 except ImportError:
-    _GEOLOCATION_AVAILABLE = False
+    _JS_EVAL_AVAILABLE = False
 
 # -------------------- Config --------------------
 st.set_page_config(
@@ -114,13 +115,13 @@ st.html(f"""
        the browser zooms out to fit any over-wide element. */
     html, body {{ overflow-x: hidden !important; }}
     div[data-testid="stAppViewContainer"] {{ overflow-x: hidden !important; }}
+    /* Trim Streamlit's ~6rem top spacer, but leave room for the fixed
+       header bar (~64px; it overlays the page). Less than this and the
+       title hides under the bar on Streamlit Cloud. */
     .main .block-container, div[data-testid="stMainBlockContainer"] {{
         max-width: 100% !important;
-        padding: 0.5rem 0.75rem 2rem 0.75rem !important;
+        padding: 4.5rem 0.75rem 2rem 0.75rem !important;
     }}
-    /* Kill the ~6rem header spacer Streamlit inserts above content. */
-    header[data-testid="stHeader"] {{ height: 2.5rem !important; }}
-    div[data-testid="stToolbar"] {{ top: 0.25rem !important; }}
 
     html {{ font-size: 17px !important; }}
 
@@ -174,10 +175,13 @@ SHORTCUT_ENABLED = bool(ANTHROPIC_KEY) and _ANTHROPIC_AVAILABLE
 # spends the owner's Google (and Claude) quota. A shared password keeps the
 # link safe to text to a travel companion.
 #
-# "Remember this phone" works via a cookie holding a hash of the password:
-# st.context.cookies reads it on page load, and a tiny script writes it after
-# a successful login. Changing APP_PASSWORD invalidates every saved cookie.
-AUTH_COOKIE = "tpf_auth"
+# "Remember this phone" saves a hash of the password in the browser, in two
+# places: a cookie (read server-side via st.context.cookies — instant, no
+# flash of the lock screen) and localStorage (read through the JS component).
+# The cookie alone wasn't enough on Streamlit Cloud, where it didn't come back
+# on later visits; localStorage is the dependable copy. Changing APP_PASSWORD
+# invalidates both.
+AUTH_KEY = "tpf_auth"
 
 
 def _auth_token(password: str) -> str:
@@ -190,18 +194,31 @@ def require_password():
         return
 
     token = _auth_token(APP_PASSWORD)
-    if hmac.compare_digest(st.context.cookies.get(AUTH_COOKIE, ""), token):
+    if hmac.compare_digest(st.context.cookies.get(AUTH_KEY, ""), token):
         st.session_state["authed"] = True
         return
 
     st.title("🗺️ Travel Places Finder")
+
+    # The localStorage answer arrives a moment after the page loads (the
+    # component reruns the script when it replies), so the form renders in
+    # the meantime — if the component never answers, the password still works.
+    if _JS_EVAL_AVAILABLE:
+        saved = streamlit_js_eval(
+            js_expressions=f"localStorage.getItem('{AUTH_KEY}') || ''",
+            key="auth_read",
+        )
+        if isinstance(saved, str) and saved and hmac.compare_digest(saved, token):
+            st.session_state["authed"] = True
+            st.rerun()
+
     with st.form("login"):
         pw = st.text_input("Password", type="password")
         submitted = st.form_submit_button("Unlock", type="primary", width="stretch")
     if submitted:
         if hmac.compare_digest(pw.encode(), APP_PASSWORD.encode()):
             st.session_state["authed"] = True
-            st.session_state["write_auth_cookie"] = True
+            st.session_state["save_login"] = True
             st.rerun()
         st.error("That password didn't work.")
     st.stop()
@@ -209,14 +226,17 @@ def require_password():
 
 require_password()
 
-# First run after login: save the cookie so this browser skips the lock
-# screen next time (one year).
-if st.session_state.pop("write_auth_cookie", False):
-    st.html(
-        "<script>document.cookie = '" + AUTH_COOKIE + "=" + _auth_token(APP_PASSWORD)
-        + "; max-age=31536000; path=/; SameSite=Lax'"
-        + " + (location.protocol === 'https:' ? '; Secure' : '');</script>",
-        unsafe_allow_javascript=True,
+# First run after login: remember this browser so it skips the lock screen
+# next time (one year).
+if st.session_state.pop("save_login", False) and _JS_EVAL_AVAILABLE:
+    _token = _auth_token(APP_PASSWORD)
+    streamlit_js_eval(
+        js_expressions=(
+            f"localStorage.setItem('{AUTH_KEY}', '{_token}');"
+            f"document.cookie = '{AUTH_KEY}={_token}; max-age=31536000; path=/; SameSite=Lax'"
+            " + (location.protocol === 'https:' ? '; Secure' : ''); 'saved'"
+        ),
+        key="auth_write",
     )
 
 if not API_KEY:
@@ -739,7 +759,7 @@ def consume_location(target_key: str):
 
 
 def location_button(target_key: str):
-    if _GEOLOCATION_AVAILABLE:
+    if _JS_EVAL_AVAILABLE:
         st.button("📍 Use my location", key=f"geo_btn_{target_key}", type="tertiary",
                   on_click=_request_location, args=(target_key,))
 
