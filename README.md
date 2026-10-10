@@ -81,6 +81,12 @@ The app opens at `http://localhost:8501`.
    Without `APP_PASSWORD`, anyone with the link can run searches on your API keys.
 4. Done. The app is now live at `https://your-app-name.streamlit.app`.
 
+## Phone home-screen launcher
+
+Streamlit Community Cloud wraps every app in its own page, so "Add to Home screen" on a phone shows Streamlit's name and icon. The `docs/` folder is a tiny GitHub Pages site — **https://jspellos.github.io/travel-places-finder/** — with its own name (JS-Travel), icon, and web manifest. It shows the Streamlit app full-screen in a frame. Add *that* page to the home screen instead.
+
+If the Streamlit app URL ever changes, update the `iframe src` in `docs/index.html`.
+
 ## File structure
 
 ```
@@ -90,6 +96,7 @@ travel-places-finder/
 ├── requirements.txt                    # Python dependencies
 ├── README.md                           # This file
 ├── .gitignore                          # Protects secrets.toml
+├── docs/                               # GitHub Pages home-screen launcher (name, icon, manifest)
 └── .streamlit/
     ├── config.toml                     # Theme color, toolbar
     └── secrets.toml.example            # Template — copy to secrets.toml
