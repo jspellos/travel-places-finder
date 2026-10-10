@@ -571,7 +571,11 @@ def render_cards(df: pd.DataFrame, distance_fn):
                    f"target='_blank' rel='noopener'>Directions</a>"]
         if row["Dial"] or row["Phone"]:
             dial = "".join(c for c in (row["Dial"] or row["Phone"]) if c.isdigit() or c == "+")
-            buttons.append(f"<a class='tpf-btn' href='tel:{esc(dial)}'>Call</a>")
+            # target=_blank matters: Streamlit Cloud runs the app in a
+            # sandboxed frame that blocks a plain tel: link, but lets
+            # popups out — and the phone hands a tel: popup to the dialer.
+            buttons.append(f"<a class='tpf-btn' href='tel:{esc(dial)}' "
+                           f"target='_blank' rel='noopener'>Call</a>")
         if str(row["Website"]).startswith(("http://", "https://")):
             buttons.append(f"<a class='tpf-btn' href='{esc(row['Website'])}' "
                            f"target='_blank' rel='noopener'>Website</a>")
