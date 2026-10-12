@@ -83,9 +83,11 @@ The app opens at `http://localhost:8501`.
 
 ## Phone home-screen launcher
 
-Streamlit Community Cloud wraps every app in its own page, so "Add to Home screen" on a phone shows Streamlit's name and icon. The `docs/` folder is a tiny GitHub Pages site — **https://jspellos.github.io/travel-places-finder/** — with its own name (JS-Travel), icon, and web manifest. It shows the Streamlit app full-screen in a frame. Add *that* page to the home screen instead.
+Streamlit Community Cloud wraps every app in its own page, so "Add to Home screen" on a phone shows Streamlit's name and icon. The `docs/` folder is a tiny GitHub Pages site — **https://jspellos.github.io/travel-places-finder/** — with its own name (JS-Travel), icon, and web manifest. It immediately redirects to the Streamlit app. Add *that* page to the home screen instead.
 
-If the Streamlit app URL ever changes, update the `iframe src` in `docs/index.html`.
+It redirects rather than showing the app in an `<iframe>`: Streamlit's "wake up" button for a sleeping app hangs inside a frame on another site, but works when the app is opened directly.
+
+If the Streamlit app URL ever changes, update the two URLs in `docs/index.html`.
 
 ## File structure
 

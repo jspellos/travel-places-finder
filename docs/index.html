@@ -9,12 +9,19 @@
 
     Streamlit Community Cloud wraps every app in its own page, so a phone's
     "Add to Home screen" picks up Streamlit's name and icon. This page is
-    served from GitHub Pages instead: it carries our own name, icon and
-    manifest, and shows the app full-screen in a frame.
+    served from GitHub Pages instead and carries our own name, icon and
+    manifest — then hands straight off to the app.
 
-    `allow="geolocation"` is needed for the "Use my location" button to work
-    inside the frame.
+    Why a redirect and not a full-screen <iframe>: when the app has gone to
+    sleep, Streamlit's "wake up" button never finishes inside a frame on
+    another site (it hangs on "taking longer than usual"), while the same
+    button works when the app is opened directly. `replace` keeps this page
+    out of the back-button history.
+
+    `embed=true` hides Streamlit's top toolbar (Fork / GitHub buttons).
   -->
+  <meta http-equiv="refresh" content="0; url=https://js-travel-places.streamlit.app/?embed=true">
+  <script>location.replace("https://js-travel-places.streamlit.app/?embed=true");</script>
   <meta name="theme-color" content="#0F766E">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
@@ -23,16 +30,19 @@
   <link rel="icon" type="image/png" href="favicon.png">
   <link rel="apple-touch-icon" href="apple-touch-icon.png">
   <style>
-    :root { --bg: #ffffff; }
-    @media (prefers-color-scheme: dark) { :root { --bg: #0e1117; } }
-    html, body { margin: 0; height: 100%; background: var(--bg); }
-    iframe { position: fixed; inset: 0; width: 100%; height: 100%; border: 0; }
+    :root { --bg: #ffffff; --fg: #1f2937; }
+    @media (prefers-color-scheme: dark) { :root { --bg: #0e1117; --fg: #e5e7eb; } }
+    html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); }
+    body {
+      display: flex; align-items: center; justify-content: center;
+      font: 17px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      padding: 0 16px; text-align: center;
+    }
+    a { color: #0F766E; font-weight: 600; }
   </style>
 </head>
 <body>
-  <iframe
-    src="https://js-travel-places.streamlit.app/?embed=true"
-    title="JS-Travel"
-    allow="geolocation; clipboard-write; fullscreen"></iframe>
+  <p>Opening JS-Travel…<br>
+    <a href="https://js-travel-places.streamlit.app/?embed=true">Tap here if nothing happens</a></p>
 </body>
 </html>
