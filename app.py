@@ -768,12 +768,78 @@ def consume_location(target_key: str):
         return
     lat, lng = coords["latitude"], coords["longitude"]
     st.session_state[target_key] = reverse_geocode(lat, lng) or f"{lat:.5f},{lng:.5f}"
+    # A spoken/typed "near me" request was waiting on this fix to search.
+    if st.session_state.pop(f"search_after_geo_{target_key}", False):
+        st.session_state["auto_search"] = True
 
 
 def location_button(target_key: str):
     if _JS_EVAL_AVAILABLE:
         st.button("📍 Use my location", key=f"geo_btn_{target_key}", type="tertiary",
                   on_click=_request_location, args=(target_key,))
+
+
+# -------------------- Voice input --------------------
+
+# Speech-to-text runs in the browser (Chrome's built-in Web Speech API — the
+# same service behind the phone keyboard's mic), so there's no extra API key
+# or cost. It follows the same async pattern as "Use my location": the 🎤
+# button sets a flag, the JS component listens and replies, Streamlit reruns.
+# The transcript lands in the "Ask in plain English" box, and the existing
+# shortcut flow parses it and searches.
+SPEECH_JS = """
+new Promise(function (resolve) {
+  var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) { resolve({error: 'unsupported'}); return; }
+  var r = new SR(), done = false;
+  r.lang = navigator.language || 'en-US';
+  r.interimResults = false;
+  r.maxAlternatives = 1;
+  r.onresult = function (e) { done = true; resolve({text: e.results[0][0].transcript}); };
+  r.onerror = function (e) { done = true; resolve({error: e.error}); };
+  r.onend = function () { if (!done) resolve({error: 'no-speech'}); };
+  try { r.start(); } catch (err) { resolve({error: String(err)}); }
+})
+"""
+
+SPEECH_ERRORS = {
+    "not-allowed": "The microphone is blocked. Allow it for this site in your browser settings.",
+    "service-not-allowed": "The microphone is blocked. Allow it for this site in your browser settings.",
+    "no-speech": "Didn't hear anything — tap 🎤 and try again.",
+    "audio-capture": "No microphone found.",
+    "network": "Voice needs an internet connection — try again in a moment.",
+    "unsupported": "This browser can't do voice input. Use the 🎤 key on your keyboard instead.",
+}
+
+
+def _request_speech():
+    st.session_state["speech_n"] = st.session_state.get("speech_n", 0) + 1
+    st.session_state["speech_pending"] = True
+
+
+def consume_speech():
+    """
+    Must run before the "Ask in plain English" text_input is created, since
+    it writes that widget's value.
+    """
+    if not st.session_state.get("speech_pending"):
+        return
+    result = streamlit_js_eval(
+        js_expressions=SPEECH_JS, key=f"speech_{st.session_state.get('speech_n', 0)}",
+    )
+    if result is None:
+        st.info("🎙️ Listening… say what you're looking for.")
+        return
+    st.session_state["speech_pending"] = False
+    text = result.get("text", "").strip() if isinstance(result, dict) else ""
+    if text:
+        st.session_state["shortcut_text"] = text
+        # Saying the same thing twice should search again, not be skipped
+        # as "already parsed".
+        st.session_state["shortcut_last_parsed"] = ""
+    else:
+        err = result.get("error", "") if isinstance(result, dict) else ""
+        st.warning(SPEECH_ERRORS.get(err, "Voice input didn't work — try again, or type instead."))
 
 
 # -------------------- Natural-language parser --------------------
@@ -831,6 +897,16 @@ PARSE_TOOL = {
             "destination": {
                 "type": "string",
                 "description": "For along_route mode. The ending point.",
+            },
+            "use_current_location": {
+                "type": "boolean",
+                "description": (
+                    "True when the user means where they are right now "
+                    "instead of naming a place: 'near me', 'around here', "
+                    "'nearby' with no place given (near_location), or "
+                    "'from here' / 'from where I am' (along_route origin). "
+                    "Leave location / origin empty in that case."
+                ),
             },
             "skip_first_miles": {
                 "type": "integer",
@@ -903,11 +979,18 @@ st.caption("Find places where you're *going* — not just where you are.")
 # Claude, then runs the search. Populates session_state so existing widgets
 # pick up the values on the next rerun.
 if SHORTCUT_ENABLED:
-    shortcut_text = st.text_input(
-        "💬 Ask in plain English",
-        placeholder="vegan dinner near Hilton Garden Inn Tarrytown",
-        key="shortcut_text",
-    )
+    voice = _JS_EVAL_AVAILABLE
+    if voice:
+        consume_speech()
+    with st.container(horizontal=True, vertical_alignment="bottom"):
+        shortcut_text = st.text_input(
+            "💬 Ask in plain English" + (" — or tap 🎤 and say it" if voice else ""),
+            placeholder="coffee near me",
+            key="shortcut_text",
+        )
+        if voice:
+            st.button("🎤", key="speak_btn", type="primary", help="Speak your search",
+                      on_click=_request_speech)
 
     # Trigger parsing when the text changes (Streamlit reruns on Enter).
     # Guard with a session_state flag so we don't re-parse identical text
@@ -930,6 +1013,9 @@ if SHORTCUT_ENABLED:
                     st.session_state["near_query"] = parsed["query"]
                 if parsed.get("radius_miles"):
                     st.session_state["near_radius"] = max(1, min(50, int(parsed["radius_miles"])))
+                if parsed.get("use_current_location") and _JS_EVAL_AVAILABLE:
+                    st.session_state["near_location"] = ""
+                    _request_location("near_location")
             elif parsed.get("mode") == "along_route":
                 st.session_state["mode"] = MODE_ROUTE
                 if parsed.get("origin"):
@@ -941,9 +1027,18 @@ if SHORTCUT_ENABLED:
                 if parsed.get("skip_first_miles") is not None:
                     skip = int(parsed["skip_first_miles"])
                     st.session_state["route_skip"] = max(0, min(50, round(skip / 5) * 5))
+                if parsed.get("use_current_location") and _JS_EVAL_AVAILABLE:
+                    st.session_state["route_origin"] = ""
+                    _request_location("route_origin")
             # Search straight away — on a phone, every saved tap counts. The
             # form still shows what was understood, so it's easy to adjust.
-            st.session_state["auto_search"] = True
+            # "Near me" requests wait for the GPS fix, then search.
+            geo_key = {"near_location": "near_location",
+                       "along_route": "route_origin"}.get(parsed.get("mode"))
+            if geo_key and st.session_state.get(f"geo_pending_{geo_key}"):
+                st.session_state[f"search_after_geo_{geo_key}"] = True
+            else:
+                st.session_state["auto_search"] = True
             st.rerun()
         else:
             st.warning("Couldn't understand that — try the form below.")

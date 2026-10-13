@@ -11,7 +11,7 @@ Two search modes:
 
 Results show as phone-friendly cards — rating, price, distance, open/closed now, and today's hours — with **Directions**, **Call**, and **Website** buttons that hand off to the phone's Maps and dialer apps. Switch to **Map** for numbered pins that match the cards. Filter by *open now* or minimum rating and change the sort without another search.
 
-With an Anthropic key set, an **Ask in plain English** box (e.g. "vegan dinner near Hilton Garden Inn Tarrytown") fills in the form and runs the search for you.
+With an Anthropic key set, an **Ask in plain English** box (e.g. "vegan dinner near Hilton Garden Inn Tarrytown") fills in the form and runs the search for you. Tap **🎤** to say it instead of typing — speech-to-text uses the browser's built-in Web Speech API (best in Chrome), so it needs no extra key. Requests like "coffee near me" or "gas from here to Philadelphia" use the phone's location.
 
 An optional **password screen** keeps the deployed app private; each browser remembers the password for a year.
 
